@@ -19,6 +19,7 @@
 #include <sound/pcm_params.h>
 #include <sound/asoundef.h>
 #include <sound/hda_register.h>
+#include <sound/hda_verbs.h>
 
 #include "creative_ae9.h"
 
@@ -232,13 +233,13 @@ void creative_ae9_dma_quiesce(struct creative_chip *chip)
 		if (!(ctl & SD_CTL_DMA_START))
 			continue;
 		/* RUN, IOCE, FEIE, DEIE off */
-		writel(ctl & SD_CTL_WMASK & ~(SD_CTL_DMA_START | 0x1c),
+		ae9_writel_flush(chip, ctl & SD_CTL_WMASK & ~(SD_CTL_DMA_START | 0x1c),
 		       chip->hda_regs + base + AZX_REG_SD_CTL);
 		ae9_sd_wait_stopped(chip, base, "at the hang");
 		stopped |= 1u << i;
 	}
 	/* no stream interrupts either (keep CIE/GIE for the controller) */
-	writel(readl(chip->hda_regs + AZX_REG_INTCTL) & 0xc0000000,
+	ae9_writel_flush(chip, readl(chip->hda_regs + AZX_REG_INTCTL) & 0xc0000000,
 	       chip->hda_regs + AZX_REG_INTCTL);
 	dev_err(chip->dev, "card stopped answering: stream DMA stopped (descriptors 0x%x)\n", stopped);
 }
@@ -345,13 +346,15 @@ static void creative_ae9_stream_reset(struct creative_chip *chip,
 	ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
 	ctl &= ~SD_CTL_DMA_START;
 	ctl |= SD_CTL_STREAM_RESET;
-	writel((ctl) & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (ctl) & SD_CTL_WMASK,
+		       chip->hda_regs + base + AZX_REG_SD_CTL);
 	wmb();
 
 	udelay(50);
 
 	ctl &= ~SD_CTL_STREAM_RESET;
-	writel((ctl) & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (ctl) & SD_CTL_WMASK,
+		       chip->hda_regs + base + AZX_REG_SD_CTL);
 	wmb();
 
 	udelay(50);
@@ -379,14 +382,15 @@ static void creative_ae9_stream_start(struct creative_chip *chip,
 		spin_lock_irqsave(&chip->lock, flags);
 		intctl = readl(chip->hda_regs + AZX_REG_INTCTL);
 		intctl |= (1 << stream_idx);
-		writel(intctl, chip->hda_regs + AZX_REG_INTCTL);
+		ae9_writel_flush(chip, intctl, chip->hda_regs + AZX_REG_INTCTL);
 		spin_unlock_irqrestore(&chip->lock, flags);
 	}
 
 	ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
 	ctl &= ~SD_CTL_STREAM_RESET;
 	ctl |= SD_CTL_DMA_START | 0x04;  /* DMA_START + IOCE (period interrupt) */
-	writel((ctl) & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (ctl) & SD_CTL_WMASK,
+		       chip->hda_regs + base + AZX_REG_SD_CTL);
 	wmb();
 }
 
@@ -397,7 +401,8 @@ static void creative_ae9_stream_stop(struct creative_chip *chip,
 
 	ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
 	ctl &= ~SD_CTL_DMA_START;
-	writel((ctl) & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (ctl) & SD_CTL_WMASK,
+		       chip->hda_regs + base + AZX_REG_SD_CTL);
 	wmb();
 	ae9_sd_wait_stopped(chip, base, "after stop");
 }
@@ -1767,11 +1772,20 @@ static int creative_ae9_pcm_hw_params(struct snd_pcm_substream *substream,
 	if (params_format(hw_params) == SNDRV_PCM_FORMAT_DSD_U32_BE)
 		ret = snd_pcm_lib_malloc_pages(substream,
 					       params_buffer_size(hw_params) * AE9_DSD_HW_FRAME);
+	else if (chip->ae7)
+		ret = snd_pcm_lib_malloc_pages(substream,
+				ae9_dma_size(chip, params_buffer_bytes(hw_params)));
 	else
 		ret = snd_pcm_lib_malloc_pages(substream,
 					       params_buffer_bytes(hw_params));
 	if (ret < 0)
 		return ret;
+	if (chip->ae7) {
+		/* Keep the bridge read-ahead area outside the ALSA buffer. */
+		memset(substream->runtime->dma_area + params_buffer_bytes(hw_params),
+		       0, chip->dma_pad);
+		substream->runtime->dma_bytes = params_buffer_bytes(hw_params);
+	}
 	/* with a copy op ALSA doesn't clear the buffer after hw_params: here
 	 * (DSD silence for DSD; prepare fills it again) */
 	if (substream->ops->copy) {
@@ -1865,37 +1879,15 @@ static void ae9_wait_hp_upload(struct creative_chip *chip)
 	mutex_unlock(&chip->replay_mutex);
 }
 
-static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
+static void creative_playback_program(struct snd_pcm_substream *substream,
+				      u16 format, unsigned int buf_size,
+				      unsigned int period_size)
 {
 	struct creative_chip *chip = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	unsigned int base = chip->playback_stream_base;
-	unsigned int buf_size = snd_pcm_lib_buffer_bytes(substream);
-	unsigned int period_size = snd_pcm_lib_period_bytes(substream);
-	bool dsd = ae9_pcm_is_dsd(runtime);
-	u16 format;
 	dma_addr_t addr;
 	int i;
-
-	/* the card stopped answering, or the driver is going away (reboot,
-	 * unload: the player's restart after the DSD abort mustn't start
-	 * DSD again beside the shutdown) */
-	if (creative_ae9_dead(chip) || READ_ONCE(chip->unloading))
-		return -ENODEV;
-	/* DSD64: Direct Mode only (it was on at open; it went off since) */
-	if (dsd && !READ_ONCE(chip->fx.direct)) {
-		dev_info_ratelimited(chip->dev, "DSD64: refused, Direct Mode is off (native DSD plays in Direct Mode only)\n");
-		return -EBUSY;
-	}
-
-	ae9_wait_hp_upload(chip);
-	creative_ae9_stream_reset(chip, base);
-
-	/* DSD64: the link carries 12-byte frames (6 x 16 bit) */
-	if (dsd) {
-		buf_size = runtime->buffer_size * AE9_DSD_HW_FRAME;
-		period_size = runtime->period_size * AE9_DSD_HW_FRAME;
-	}
 
 	/* Build BDL entries (keep as fallback) */
 	memset(chip->playback_bdl, 0, CREATIVE_PCM_BDL_SIZE);
@@ -1930,20 +1922,14 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 
 		ctl &= ~(0xf << 20);
 		ctl |= ((CREATIVE_PCM_STREAM_TAG & 0xf) << 20);
-		writel((ctl) & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
+		ae9_writel_flush(chip, (ctl) & SD_CTL_WMASK,
+			       chip->hda_regs + base + AZX_REG_SD_CTL);
 		wmb();
 	}
 
 	creative_hda_writel(chip, base + AZX_REG_SD_CBL, buf_size);
 	creative_hda_writew(chip, base + AZX_REG_SD_LVI, runtime->periods - 1);
 
-	/* S32_LE container; 24-bit (0x31 at 48 kHz) or 32-bit (0x41); DSD64
-	 * as Windows sends it: 6 x 16 bit at 88.2 kHz (0x4815) */
-	if (dsd)
-		format = AE9_DSD_FMT;
-	else
-		format = creative_ae9_stream_format(runtime->channels, chip->pcm_bits,
-						    runtime->rate);
 	creative_hda_writew(chip, base + AZX_REG_SD_FORMAT, format);
 
 	/* Write BDL pointer as fallback */
@@ -1952,6 +1938,43 @@ static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
 	creative_hda_writel(chip, base + AZX_REG_SD_BDLPU,
 			    upper_32_bits(chip->playback_bdl_dma));
 	ae9_dma_trace_prep(chip, "playback", base, substream, chip->playback_bdl_dma);
+}
+
+static int creative_ae9_pcm_prepare(struct snd_pcm_substream *substream)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	unsigned int buf_size = snd_pcm_lib_buffer_bytes(substream);
+	unsigned int period_size = snd_pcm_lib_period_bytes(substream);
+	bool dsd = ae9_pcm_is_dsd(runtime);
+	u16 format;
+
+	/* the card stopped answering, or the driver is going away (reboot,
+	 * unload: the player's restart after the DSD abort mustn't start
+	 * DSD again beside the shutdown) */
+	if (creative_ae9_dead(chip) || READ_ONCE(chip->unloading))
+		return -ENODEV;
+	/* DSD64: Direct Mode only (it was on at open; it went off since) */
+	if (dsd && !READ_ONCE(chip->fx.direct)) {
+		dev_info_ratelimited(chip->dev, "DSD64: refused, Direct Mode is off (native DSD plays in Direct Mode only)\n");
+		return -EBUSY;
+	}
+
+	ae9_wait_hp_upload(chip);
+	creative_ae9_stream_reset(chip, chip->playback_stream_base);
+
+	/* S32_LE container; 24-bit (0x31 at 48 kHz) or 32-bit (0x41); DSD64
+	 * as Windows sends it: 6 x 16 bit at 88.2 kHz (0x4815).
+	 */
+	if (dsd) {
+		buf_size = runtime->buffer_size * AE9_DSD_HW_FRAME;
+		period_size = runtime->period_size * AE9_DSD_HW_FRAME;
+		format = AE9_DSD_FMT;
+	} else {
+		format = creative_ae9_stream_format(runtime->channels, chip->pcm_bits,
+						    runtime->rate);
+	}
+	creative_playback_program(substream, format, buf_size, period_size);
 
 	if (dsd)
 		return ae9_dsd_prepare(chip, runtime);
@@ -2094,6 +2117,251 @@ static const struct snd_pcm_ops creative_ae9_pcm_dsd_ops = {
 	.fill_silence	= creative_ae9_pcm_fill_silence,
 };
 
+/*
+ * AE-7 Windows headphone playback: SD4/stream tag 1, format 0x0035,
+ * and codec 1 node 0x02. The user-space route supplies six slots with
+ * PCM only in the front pair.
+ */
+#define AE7_HEADPHONE_FMT	0x0035
+
+static const struct snd_pcm_hardware creative_ae7_playback_hw = {
+	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
+		SNDRV_PCM_INFO_INTERLEAVED,
+	.formats = SNDRV_PCM_FMTBIT_S32_LE,
+	.rates = SNDRV_PCM_RATE_48000,
+	.rate_min = 48000,
+	.rate_max = 48000,
+	.channels_min = 6,
+	.channels_max = 6,
+	.buffer_bytes_max = CREATIVE_PCM_BUF_MAX,
+	.period_bytes_min = 4096,
+	.period_bytes_max = 128 * 1024,
+	.periods_min = 2,
+	.periods_max = CREATIVE_PCM_BDL_MAX,
+};
+
+static int creative_ae7_pcm_ready(struct creative_chip *chip)
+{
+	if (creative_ae9_dead(chip) || READ_ONCE(chip->unloading))
+		return -ENODEV;
+	/* Pair with the release store after the DSP and route are ready. */
+	if (READ_ONCE(chip->suspended) || !smp_load_acquire(&chip->dsp_done))
+		return -ESTRPIPE;
+	return 0;
+}
+
+static int creative_ae7_pcm_open(struct snd_pcm_substream *substream)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	int ret;
+
+	ret = creative_ae7_pcm_ready(chip);
+	if (ret < 0)
+		return ret;
+	runtime->hw = creative_ae7_playback_hw;
+	runtime->hw.periods_max = clamp_t(unsigned int, pcm_periods, 2,
+					 CREATIVE_PCM_BDL_MAX);
+	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	if (ret < 0)
+		return ret;
+	ret = snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
+					 128);
+	if (ret < 0)
+		return ret;
+	ret = snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
+					 128);
+	if (ret < 0)
+		return ret;
+	ret = snd_pcm_hw_constraint_msbits(runtime, 0, 32, 24);
+	if (ret < 0)
+		return ret;
+
+	WRITE_ONCE(chip->playback_substream, substream);
+	return 0;
+}
+
+static int creative_ae7_pcm_close(struct snd_pcm_substream *substream)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+
+	WRITE_ONCE(chip->playback_substream, NULL);
+	return 0;
+}
+
+static int creative_ae7_pcm_wait_idle(struct creative_chip *chip, const char *why)
+{
+	if (chip->card_gone ||
+	    ae9_sd_wait_stopped(chip, chip->playback_stream_base, why))
+		return 0;
+
+	/* Fence DMA before ALSA can reuse the buffer or free its pages. */
+	pci_clear_master(chip->pci);
+	WRITE_ONCE(chip->card_hung, true);
+	return -EIO;
+}
+
+static int creative_ae7_pcm_hw_params(struct snd_pcm_substream *substream,
+				      struct snd_pcm_hw_params *params)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	int ret;
+
+	mutex_lock(&chip->replay_mutex);
+	WRITE_ONCE(chip->pb_format, 0);
+	ret = creative_ae7_pcm_ready(chip);
+	if (!ret && chip->pcm_start_sent)
+		ret = creative_ae7_pcm_wait_idle(chip, "at AE-7 PCM hw_params");
+	if (!ret)
+		ret = creative_ae9_pcm_hw_params(substream, params);
+	mutex_unlock(&chip->replay_mutex);
+	return ret;
+}
+
+static int creative_ae7_converter(struct creative_chip *chip, u32 cmd,
+				  u32 payload)
+{
+	u32 verb = creative_ae9_verb(CREATIVE_PCM_CODEC_ADDR, CREATIVE_PCM_DAC_NID,
+				     cmd, payload);
+	u32 response;
+	int ret;
+
+	ret = creative_ae9_corb_send_verb_sync(chip, verb, &response);
+	if (ret < 0)
+		dev_err(chip->dev, "AE-7 PCM: HDA verb %#08x failed: %d\n", verb, ret);
+	return ret;
+}
+
+static int creative_ae7_pcm_hw_free(struct snd_pcm_substream *substream)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	int ret = 0;
+
+	/* The PCM core synchronizes the IRQ before invoking hw_free. */
+	mutex_lock(&chip->replay_mutex);
+	WRITE_ONCE(chip->pb_format, 0);
+	if (chip->pcm_start_sent) {
+		ret = creative_ae7_pcm_wait_idle(chip, "at AE-7 PCM hw_free");
+		if (!ret && !creative_ae7_pcm_ready(chip))
+			ret = creative_ae7_converter(chip, AC_VERB_SET_CHANNEL_STREAMID, 0);
+		chip->pcm_start_sent = 0;
+	}
+	if (chip->playback_bdl_raw) {
+		dma_free_coherent(chip->dev, chip->playback_bdl_size,
+				  chip->playback_bdl_raw, chip->playback_bdl_dma);
+		chip->playback_bdl_raw = NULL;
+		chip->playback_bdl = NULL;
+	}
+	snd_pcm_lib_free_pages(substream);
+	mutex_unlock(&chip->replay_mutex);
+	return ret;
+}
+
+static int creative_ae7_pcm_prepare(struct snd_pcm_substream *substream)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	int ret;
+
+	mutex_lock(&chip->replay_mutex);
+	WRITE_ONCE(chip->pb_format, 0);
+	ret = creative_ae7_pcm_ready(chip);
+	if (ret < 0)
+		goto out;
+	ret = creative_ae7_pcm_wait_idle(chip, "before AE-7 PCM prepare");
+	if (ret < 0)
+		goto out;
+
+	creative_ae9_stream_reset(chip, chip->playback_stream_base);
+	/* Windows enables this ChipIO path immediately before binding NID 2. */
+	ret = creative_dsp_chipio_write(chip, 0x18b008, 0xf0);
+	if (ret < 0) {
+		dev_err(chip->dev, "AE-7 PCM: playback path enable failed: %d\n",
+			ret);
+		goto out;
+	}
+	ret = creative_ae7_converter(chip, AC_VERB_SET_STREAM_FORMAT,
+				    AE7_HEADPHONE_FMT);
+	if (ret < 0)
+		goto out;
+	/* A response timeout after SET_CHANNEL_STREAMID may still bind the
+	 * converter. Leave hw_free responsible for unbinding it.
+	 */
+	chip->pcm_start_sent = 1;
+	ret = creative_ae7_converter(chip, AC_VERB_SET_CHANNEL_STREAMID,
+				    CREATIVE_PCM_STREAM_TAG << 4);
+	if (ret < 0)
+		goto out;
+
+	creative_playback_program(substream, AE7_HEADPHONE_FMT,
+				  snd_pcm_lib_buffer_bytes(substream),
+				  snd_pcm_lib_period_bytes(substream));
+	WRITE_ONCE(chip->pb_format, AE7_HEADPHONE_FMT);
+out:
+	mutex_unlock(&chip->replay_mutex);
+	return ret;
+}
+
+static int creative_ae7_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+	unsigned int base = chip->playback_stream_base;
+	unsigned int stream_idx = (base - 0x80) / 0x20;
+	unsigned long flags;
+	u32 intctl;
+	int ret;
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+		ret = creative_ae7_pcm_ready(chip);
+		if (ret < 0)
+			return ret;
+		if (READ_ONCE(chip->pb_format) != AE7_HEADPHONE_FMT)
+			return -EIO;
+		creative_ae9_stream_start(chip, base);
+		return 0;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+		if (!READ_ONCE(chip->pb_format) || READ_ONCE(chip->card_gone))
+			return 0;
+		creative_ae9_stream_stop(chip, base);
+		spin_lock_irqsave(&chip->lock, flags);
+		intctl = creative_hda_readl(chip, AZX_REG_INTCTL);
+		creative_hda_writel(chip, AZX_REG_INTCTL, intctl & ~BIT(stream_idx));
+		spin_unlock_irqrestore(&chip->lock, flags);
+		creative_hda_writeb(chip, base + AZX_REG_SD_STS, SD_INT_MASK);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int creative_ae7_pcm_sync_stop(struct snd_pcm_substream *substream)
+{
+	/* ALSA calls sync_stop at the suspend boundary as well as at close. */
+	synchronize_irq(substream->pcm->card->sync_irq);
+	return 0;
+}
+
+static snd_pcm_uframes_t creative_ae7_pcm_pointer(struct snd_pcm_substream *substream)
+{
+	struct creative_chip *chip = snd_pcm_substream_chip(substream);
+
+	if (creative_ae7_pcm_ready(chip))
+		return 0;
+	return creative_ae9_pcm_pointer(substream);
+}
+
+static const struct snd_pcm_ops creative_ae7_pcm_ops = {
+	.open		= creative_ae7_pcm_open,
+	.close		= creative_ae7_pcm_close,
+	.hw_params	= creative_ae7_pcm_hw_params,
+	.hw_free	= creative_ae7_pcm_hw_free,
+	.prepare	= creative_ae7_pcm_prepare,
+	.trigger	= creative_ae7_pcm_trigger,
+	.sync_stop	= creative_ae7_pcm_sync_stop,
+	.pointer	= creative_ae7_pcm_pointer,
+};
+
 /* ------------------------------------------------------------------ */
 /* Separate optical playback: PCM device 4, stream base 0x140, tag 3,  */
 /* codec 2 converter 0x05; while it isn't prepared, 0x05 mirrors main.	  */
@@ -2228,7 +2496,8 @@ static int creative_ae9_opt_prepare(struct snd_pcm_substream *substream)
 
 		ctl &= ~(0xf << 20);
 		ctl |= ((CREATIVE_OPT_STREAM_TAG & 0xf) << 20);
-		writel((ctl) & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
+		ae9_writel_flush(chip, (ctl) & SD_CTL_WMASK,
+			       chip->hda_regs + base + AZX_REG_SD_CTL);
 		wmb();
 	}
 	creative_hda_writel(chip, base + AZX_REG_SD_CBL, buf_size);
@@ -2292,7 +2561,8 @@ void creative_ae9_opt_irq(struct creative_chip *chip)
 
 	if (!sts)
 		return;
-	writeb(sts & SD_INT_MASK, chip->hda_regs + base + AZX_REG_SD_STS);
+	ae9_writeb_flush(chip, sts & SD_INT_MASK,
+		       chip->hda_regs + base + AZX_REG_SD_STS);
 	if ((sts & SD_INT_COMPLETE) && chip->opt_substream)
 		snd_pcm_period_elapsed(chip->opt_substream);
 }
@@ -2596,7 +2866,8 @@ static int creative_ae9_cap_prepare(struct snd_pcm_substream *substream)
 	ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
 	ctl &= ~(0xf << 20);
 	ctl |= (CREATIVE_CAP_STREAM_TAG & 0xf) << 20;
-	writel((ctl) & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (ctl) & SD_CTL_WMASK,
+		       chip->hda_regs + base + AZX_REG_SD_CTL);
 	wmb();
 	creative_hda_writel(chip, base + AZX_REG_SD_CBL, period * periods);
 	creative_hda_writew(chip, base + AZX_REG_SD_LVI, periods - 1);
@@ -2692,7 +2963,8 @@ void creative_ae9_cap_irq(struct creative_chip *chip)
 
 	if (!sts)
 		return;
-	writeb(sts & SD_INT_MASK, chip->hda_regs + base + AZX_REG_SD_STS);
+	ae9_writeb_flush(chip, sts & SD_INT_MASK,
+		       chip->hda_regs + base + AZX_REG_SD_STS);
 	if ((sts & SD_INT_COMPLETE) && chip->capture_substream)
 		snd_pcm_period_elapsed(chip->capture_substream);
 }
@@ -2945,7 +3217,8 @@ static int creative_ae9_xcap_prepare(struct snd_pcm_substream *substream)
 	ctl = readl(chip->hda_regs + base + AZX_REG_SD_CTL);
 	ctl &= ~(0xf << 20);
 	ctl |= (x->tag & 0xf) << 20;
-	writel(ctl & SD_CTL_WMASK, chip->hda_regs + base + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, ctl & SD_CTL_WMASK,
+		       chip->hda_regs + base + AZX_REG_SD_CTL);
 	wmb();
 	format = creative_ae9_stream_format(runtime->channels, 24, runtime->rate);
 	creative_hda_writel(chip, base + AZX_REG_SD_CBL, period * periods);
@@ -3126,7 +3399,8 @@ void creative_ae9_xcap_irq(struct creative_chip *chip, unsigned int i)
 
 	if (!sts)
 		return;
-	writeb(sts & SD_INT_MASK, chip->hda_regs + base + AZX_REG_SD_STS);
+	ae9_writeb_flush(chip, sts & SD_INT_MASK,
+		       chip->hda_regs + base + AZX_REG_SD_STS);
 	if ((sts & SD_INT_COMPLETE) && chip->xcap[i].substream) {
 		WRITE_ONCE(chip->xcap[i].irqs, chip->xcap[i].irqs + 1);
 		snd_pcm_period_elapsed(chip->xcap[i].substream);
@@ -3176,6 +3450,30 @@ static void creative_ae9_xcap_new(struct creative_chip *chip, unsigned int i)
 /* ------------------------------------------------------------------ */
 
 static void creative_ae9_pcm_free(struct snd_pcm *pcm);
+
+int creative_ae7_pcm_init(struct creative_chip *chip)
+{
+	struct snd_pcm *pcm;
+	int ret;
+
+	chip->playback_stream_tag = CREATIVE_PCM_STREAM_TAG;
+	chip->playback_stream_base = CREATIVE_PCM_STREAM_BASE;
+
+	ret = snd_pcm_new(chip->card, "AE-7 Headphones", 0, 1, 0, &pcm);
+	if (ret < 0)
+		return ret;
+
+	pcm->private_data = chip;
+	pcm->private_free = creative_ae9_pcm_free;
+	strscpy(pcm->name, "AE-7 Headphones", sizeof(pcm->name));
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &creative_ae7_pcm_ops);
+	snd_pcm_lib_preallocate_pages_for_all(pcm, SNDRV_DMA_TYPE_DEV,
+		chip->dev, ae9_dma_size(chip, CREATIVE_PCM_BUF_MAX),
+		ae9_dma_size(chip, CREATIVE_PCM_BUF_MAX));
+	chip->pcm = pcm;
+	ae9_pcm_track(chip, pcm);
+	return 0;
+}
 
 int creative_ae9_pcm_init(struct creative_chip *chip)
 {

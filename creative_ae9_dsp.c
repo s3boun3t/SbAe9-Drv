@@ -24,6 +24,7 @@
 #include <linux/ktime.h>
 #include <linux/slab.h>
 #include <linux/dma-mapping.h>
+#include <linux/module.h>
 #include <sound/hda_register.h>
 #include <sound/hdaudio.h>
 
@@ -206,6 +207,9 @@ static int fls_image_check(struct creative_chip *chip, const struct firmware *fw
 #define DESKTOP_EFX_FILE "ctefx-desktop.bin"
 #define DESKTOP_EFX_SIZE 655436		/* the tested AE-9 image */
 #define AE9_OVERLAY_SIZE 432
+#define AE7_DESKTOP_EFX_FILE "creative-ae7/ctefx-desktop.bin"
+#define AE7_DESKTOP_EFX_SIZE 655856
+MODULE_FIRMWARE(AE7_DESKTOP_EFX_FILE);
 
 /*
  * Creative's DSP images live in creative-ae9/ (ae9-get-firmware 0.10.1+).
@@ -264,11 +268,11 @@ static unsigned int dsp_read(struct creative_chip *chip, u8 nid,
 	return resp;
 }
 
-static void dsp_write(struct creative_chip *chip, u8 nid, u16 verb, u16 payload)
+static int dsp_write(struct creative_chip *chip, u8 nid, u16 verb, u16 payload)
 {
 	u32 resp = 0;
 
-	verb_send(chip, creative_ae9_verb(CAD, nid, verb, payload), &resp);
+	return verb_send(chip, creative_ae9_verb(CAD, nid, verb, payload), &resp);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1404,18 +1408,18 @@ static void xfer_stream_run(struct creative_chip *chip, unsigned int sdoff,
 {
 	void __iomem *sd = chip->hda_regs + sdoff;
 
-	writel(SD_CTL_STREAM_RESET, sd + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, SD_CTL_STREAM_RESET, sd + AZX_REG_SD_CTL);
 	udelay(50);
-	writel(0, sd + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, 0, sd + AZX_REG_SD_CTL);
 	udelay(50);
-	writel(tag << 20, sd + AZX_REG_SD_CTL);
-	writel(OVL_BUF_BYTES, sd + AZX_REG_SD_CBL);
-	writew(OVL_BDL_ENTRIES - 1, sd + AZX_REG_SD_LVI);
-	writew(OVL_FMT, sd + AZX_REG_SD_FORMAT);
-	writel(lower_32_bits(bdl_dma), sd + AZX_REG_SD_BDLPL);
-	writel(upper_32_bits(bdl_dma), sd + AZX_REG_SD_BDLPU);
+	ae9_writel_flush(chip, tag << 20, sd + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, OVL_BUF_BYTES, sd + AZX_REG_SD_CBL);
+	ae9_writew_flush(chip, OVL_BDL_ENTRIES - 1, sd + AZX_REG_SD_LVI);
+	ae9_writew_flush(chip, OVL_FMT, sd + AZX_REG_SD_FORMAT);
+	ae9_writel_flush(chip, lower_32_bits(bdl_dma), sd + AZX_REG_SD_BDLPL);
+	ae9_writel_flush(chip, upper_32_bits(bdl_dma), sd + AZX_REG_SD_BDLPU);
 	wmb();
-	writel((tag << 20) | SD_CTL_DMA_START, sd + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (tag << 20) | SD_CTL_DMA_START, sd + AZX_REG_SD_CTL);
 	wmb();
 }
 
@@ -1434,7 +1438,7 @@ static bool xfer_stream_stop(struct creative_chip *chip, unsigned int sdoff,
 	unsigned int i;
 	u32 ctl = 0;
 
-	writel(tag << 20, sd + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, tag << 20, sd + AZX_REG_SD_CTL);
 	for (i = 0; i < 1000; i++) {
 		ctl = readl(sd + AZX_REG_SD_CTL);
 		if (!(ctl & SD_CTL_DMA_START))
@@ -1449,49 +1453,30 @@ static bool xfer_stream_stop(struct creative_chip *chip, unsigned int sdoff,
 			 sdoff, ctl);
 		return false;
 	}
-	writel(SD_CTL_STREAM_RESET, sd + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, SD_CTL_STREAM_RESET, sd + AZX_REG_SD_CTL);
 	for (i = 0; i < 100 && !(readl(sd + AZX_REG_SD_CTL) & SD_CTL_STREAM_RESET); i++)
 		udelay(10);
-	writel(0, sd + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, 0, sd + AZX_REG_SD_CTL);
 	for (i = 0; i < 100 && (readl(sd + AZX_REG_SD_CTL) & SD_CTL_STREAM_RESET); i++)
 		udelay(10);
-	writel(0, sd + AZX_REG_SD_BDLPL);
-	writel(0, sd + AZX_REG_SD_BDLPU);
+	ae9_writel_flush(chip, 0, sd + AZX_REG_SD_BDLPL);
+	ae9_writel_flush(chip, 0, sd + AZX_REG_SD_BDLPU);
 	readl(sd + AZX_REG_SD_CTL);	/* flush the posted writes */
 	return true;
 }
 
-static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out);
-
-static int dsp_overlay_xfer(struct creative_chip *chip, u32 *chan_out)
+static int dsp_overlay_xfer_once(struct creative_chip *chip,
+				 const struct ae9_dsp_image_seg *seg,
+				 u32 *chan_out)
 {
-	if (chip->card_gone)
-		return -ENODEV;
-	return dsp_overlay_xfer_once(chip, chan_out);
-}
-
-static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
-{
-	const struct firmware *fw;
-	const struct ae9_dsp_image_seg *seg;
 	void *buf = NULL;
 	__le32 *bdl = NULL;
 	dma_addr_t buf_dma = 0, bdl_dma = 0;
 	unsigned int port, i, segno = 0, rl;
-	u32 chan = ~0U, resp;
+	u32 chan = ~0U;
 	bool stuck = false;	/* the transfer stream didn't stop: keep buf/bdl */
 	int ret;
 
-	ret = ae9_request_fw(chip, &fw, AE9_OVERLAY_FILE, AE9_OVERLAY_SIZE);
-	if (ret) {
-		dev_warn(chip->dev, "overlay: /lib/firmware/%s not available (%d), skipped; extract it with extract_overlay.py\n",
-			 AE9_OVERLAY_FILE, ret);
-		return ret;
-	}
-	if (fls_image_check(chip, fw, AE9_OVERLAY_FILE)) {
-		release_firmware(fw);
-		return -EINVAL;
-	}
 	buf = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), &buf_dma, GFP_KERNEL);
 	bdl = dma_alloc_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), &bdl_dma, GFP_KERNEL);
 	if (!buf || !bdl) {
@@ -1508,15 +1493,30 @@ static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 	}
 
 	/* ChipIO converter on tag 1, DMA channel, port (cold capture 4468-4505) */
-	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_STREAM_FORMAT, OVL_FMT);
-	dsp_write(chip, WIDGET_CHIP_CTRL, 0x706, 0x10);
+	ret = dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_STREAM_FORMAT,
+			OVL_FMT);
+	if (chip->ae7 && ret)
+		goto out;
+	ret = dsp_write(chip, WIDGET_CHIP_CTRL, 0x706, 0x10);
+	if (chip->ae7 && ret)
+		goto unbind;
 	rl = sizeof(chan);
 	ret = dspio_scp(chip, MASTERCONTROL, 0, 0x0a, SCP_GET, NULL, 0, &chan, &rl);
 	dev_info(chip->dev, "overlay: alloc DMA chan ret=%d chan=0x%x\n", ret, chan);
 	if (ret)
 		goto unbind;
-	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_CONFIG_SET, 0x01);
-	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_SET, 0x10);
+	if (chip->ae7 && (rl != sizeof(chan) || chan >= 12)) {
+		chan = ~0U;
+		ret = -EIO;
+		goto unbind;
+	}
+	ret = dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_CONFIG_SET,
+			0x01);
+	if (chip->ae7 && ret)
+		goto unbind;
+	ret = dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_SET, 0x10);
+	if (chip->ae7 && ret)
+		goto free_port;
 	port = dsp_read(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_GET, 0);
 	/*
 	 * 0xff now and then (2026-11-04: on both boots whose DSP mode came up
@@ -1533,23 +1533,31 @@ static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 		 i ? ((port == 0 || port > 0xf) ? ", still bad after retries" :
 		      ", after a retry") : "");
 	if (port == 0 || port > 0xf) {
+		if (chip->ae7 && port != 0) {
+			ret = -EIO;
+			goto free_port;
+		}
 		/* read came back as 0xff000000 once; Windows always got 3 */
 		port = 3;
 		dev_info(chip->dev, "overlay: implausible port, using 3\n");
 	}
 
-	for (seg = (const void *)fw->data;
-	     (const u8 *)seg + sizeof(*seg) <= fw->data + fw->size && !seg_is_last(seg);
-	     seg = seg_next(seg), segno++) {
+	for (; !seg_is_last(seg); seg = seg_next(seg), segno++) {
 		bool code = UC_RANGE(seg->chip_addr, 1);
 		unsigned int rem = seg->count % 2;	/* 2 words per frame */
 		unsigned int n = seg->count - rem;
 		u32 a3a[2] = { port, code ? 0xffff8a00 : 0 };
 		u32 a3b[2] = { (n << 16) | (((seg->chip_addr / 4) + rem) & 0xffff),
 			       code ? 0x80000000 : 0 };
-		u32 r = 0, v;
+		u32 r = 0, v = ~0U;
+		u32 pending = chip->ae7 ? BIT(chan) : 0xfff;
 		unsigned int t;
 
+		if (chip->ae7) {
+			/* Code flag and allocated channel, as for HPEQ. */
+			a3a[1] = (code ? BIT(31) : 0) | chan;
+			a3b[1] |= chan;
+		}
 		if (n * 4 > OVL_BUF_BYTES) {
 			ret = -EINVAL;
 			break;
@@ -1567,13 +1575,24 @@ static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 		rl = sizeof(r);
 		ret = dspio_scp(chip, MASTERCONTROL, 0, 0x3a, SCP_GET, a3a,
 				sizeof(a3a), &r, &rl);
+		if (chip->ae7 && ret)
+			break;
 		rl = sizeof(r);
 		ret |= dspio_scp(chip, MASTERCONTROL, 0, 0x3b, SCP_GET, a3b,
 				 sizeof(a3b), &r, &rl);
+		if (chip->ae7 && ret)
+			break;
 		xfer_stream_run(chip, OVL_SD, 1, bdl_dma);
+
+		/* Windows writes the odd leading word during the second run. */
+		if (chip->ae7 && rem)
+			ret = creative_dsp_chipio_write(chip, seg->chip_addr,
+							seg->data[0]);
 		for (t = 0; t < 200; t++) {
-			creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &v);
-			if (!(v & 0xfff))
+			if (creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET,
+						     &v) && chip->ae7)
+				v = ~0U;
+			if (!(v & pending))
 				break;
 			usleep_range(1000, 2000);
 		}
@@ -1583,10 +1602,15 @@ static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 			ret = -EIO;
 			break;
 		}
+		if (chip->ae7 && (ret || (v & pending))) {
+			ret = ret ?: -ETIMEDOUT;
+			break;
+		}
 		/* leftover word(s) go in directly (Windows: 0x03f3a0 = 0x00800082) */
-		for (i = 0; i < rem; i++)
-			creative_dsp_chipio_write(chip, seg->chip_addr + 4 * i,
-						  seg->data[i]);
+		if (!chip->ae7)
+			for (i = 0; i < rem; i++)
+				creative_dsp_chipio_write(chip, seg->chip_addr + 4 * i,
+							  seg->data[i]);
 		{
 			unsigned int act = 0, f00 = 0, f04 = 0, f08 = 0;
 
@@ -1597,14 +1621,18 @@ static int dsp_overlay_xfer_once(struct creative_chip *chip, u32 *chan_out)
 			dev_info(chip->dev,
 				 "overlay: seg%u chip 0x%06x %u words: 0x3a [%x %08x] 0x3b [%08x %08x] ret=%d, %s after %u polls (0x110ff0=0x%x ff8=0x%x f00=0x%x f04=0x%x f08=0x%x)\n",
 				 segno, seg->chip_addr, seg->count, a3a[0], a3a[1],
-				 a3b[0], a3b[1], ret, (v & 0xfff) ? "DMA NOT done" : "DMA done",
+				 a3b[0], a3b[1], ret, (v & pending) ? "DMA NOT done" : "DMA done",
 				 t, v, act, f00, f04, f08);
 		}
 	}
 
-	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10);
+free_port:
+	if (dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_FREE_SET, 0x10) &&
+	    chip->ae7 && !ret)
+		ret = -EIO;
 unbind:
-	dsp_write(chip, WIDGET_CHIP_CTRL, 0x706, 0x00);
+	if (dsp_write(chip, WIDGET_CHIP_CTRL, 0x706, 0x00) && chip->ae7 && !ret)
+		ret = -EIO;
 	creative_dsp_chipio_addr_invalidate();
 	*chan_out = chan;
 out:
@@ -1622,8 +1650,30 @@ out:
 		dma_free_coherent(chip->dev, ae9_dma_size(chip, OVL_BUF_BYTES), buf, buf_dma);
 	if (bdl && !stuck)
 		dma_free_coherent(chip->dev, ae9_dma_size(chip, 16 * OVL_BDL_ENTRIES), bdl, bdl_dma);
+	return ret;
+}
+
+static int dsp_overlay_xfer(struct creative_chip *chip,
+			    const struct ae9_dsp_image_seg *overlay, u32 *chan_out)
+{
+	const struct firmware *fw;
+	int ret;
+
+	if (chip->card_gone)
+		return -ENODEV;
+	if (overlay)
+		return dsp_overlay_xfer_once(chip, overlay, chan_out);
+
+	ret = ae9_request_fw(chip, &fw, AE9_OVERLAY_FILE, AE9_OVERLAY_SIZE);
+	if (ret) {
+		dev_warn(chip->dev, "overlay: /lib/firmware/%s not available (%d), skipped; extract it with extract_overlay.py\n",
+			 AE9_OVERLAY_FILE, ret);
+		return ret;
+	}
+	ret = fls_image_check(chip, fw, AE9_OVERLAY_FILE);
+	if (!ret)
+		ret = dsp_overlay_xfer_once(chip, (const void *)fw->data, chan_out);
 	release_firmware(fw);
-	(void)resp;
 	return ret;
 }
 
@@ -2102,7 +2152,7 @@ static bool dsp_overlay_landed(struct creative_chip *chip, u32 *got)
 	}
 	creative_dsp_chipio_addr_invalidate();
 	*got = b;
-	return b == OVL_CHECK_WANT;
+	return b == OVL_CHECK_WANT && (!chip->ae7 || i < 4);
 }
 
 /*
@@ -2113,7 +2163,8 @@ static bool dsp_overlay_landed(struct creative_chip *chip, u32 *got)
  * image extract_overlay.py takes from CtxHda.sys (its payload isn't in the
  * capture).
  */
-int creative_dsp_boot_handshake(struct creative_chip *chip)
+static int dsp_boot_handshake(struct creative_chip *chip,
+			      const struct ae9_dsp_image_seg *overlay)
 {
 	static const struct { u8 req; u32 val; } states[] = {
 		{ 0x0c, 3 }, { 0x0c, 4 }, { 0x0c, 5 }, { 0x0c, 0 },
@@ -2126,7 +2177,25 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 	for (i = 0; i < ARRAY_SIZE(states); i++) {
 		if (chip->card_gone)
 			return -ENODEV;
-		if (i == 1) {
+		if (i == 1 && overlay) {
+			u32 check;
+			int release = 0;
+
+			chan = ~0U;
+			ret = dsp_overlay_xfer(chip, overlay, &chan);
+			if (chan != ~0U)
+				release = scp_set_u32(chip, MASTERCONTROL, 0x0a, chan);
+			if (ret || release)
+				return ret ?: release;
+			if (!dsp_overlay_landed(chip, &check)) {
+				dev_err(chip->dev, "AE-7 overlay check failed: %#08x\n", check);
+				return -EIO;
+			}
+			chip->overlay_sent = true;
+			ret = scp_set_u32(chip, MASTERCONTROL, 0x0b, 1);
+			if (ret)
+				return ret;
+		} else if (i == 1) {
 			/* Between states 3 and 4: DMA channel alloc, overlay
 			 * transfer, channel free, then 0x0b = 1, as Windows
 			 * does.
@@ -2135,7 +2204,7 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 			bool landed;
 
 			chan = ~0U;
-			ret = dsp_overlay_xfer(chip, &chan);
+			ret = dsp_overlay_xfer(chip, NULL, &chan);
 			landed = dsp_overlay_landed(chip, &chk);
 			if (!landed) {
 				/* free the channel, then go again */
@@ -2145,7 +2214,7 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 				if (chan != ~0U)
 					scp_set_u32(chip, MASTERCONTROL, 0x0a, chan);
 				chan = ~0U;
-				ret = dsp_overlay_xfer(chip, &chan);
+				ret = dsp_overlay_xfer(chip, NULL, &chan);
 				landed = dsp_overlay_landed(chip, &chk);
 				dev_info(chip->dev, "overlay: second try ret=%d, %s (check word 0x%08x)\n",
 					 ret, landed ? "landed" : "STILL NOT landed", chk);
@@ -2166,6 +2235,8 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 
 		ret = scp_set_u32(chip, MASTERCONTROL, states[i].req,
 				  states[i].val);
+		if (overlay && ret)
+			return ret;
 		v = ~0U;
 		t0 = jiffies;
 		/* Each unanswered GET already waits up to 1s in dspio_scp(). */
@@ -2175,7 +2246,7 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 				break;
 			/* with a retry to come: Windows' 2 s per state
 			 * (FUN_00029230), not ~11 s */
-			if (i == 0 && dsp_fail_fast(chip) &&
+			if ((overlay || (i == 0 && dsp_fail_fast(chip))) &&
 			    time_after(jiffies, t0 + msecs_to_jiffies(2000)))
 				break;
 			/* Windows: the first GET reads 1, the next ~110 ms
@@ -2190,11 +2261,16 @@ int creative_dsp_boot_handshake(struct creative_chip *chip)
 			err = -ETIMEDOUT;
 			/* a retry (soft or the whole bring-up) comes next:
 			 * don't sit out every remaining timeout */
-			if (dsp_fail_fast(chip) && i == 0)
+			if (overlay || (dsp_fail_fast(chip) && i == 0))
 				return err;
 		}
 	}
 	return err;
+}
+
+int creative_dsp_boot_handshake(struct creative_chip *chip)
+{
+	return dsp_boot_handshake(chip, NULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2216,20 +2292,23 @@ static unsigned int dsp_chip_to_dsp_addx(unsigned int chip_addx,
 	return INVALID_CHIP_ADDX;
 }
 
-static bool dsp_is_dma_active(struct creative_chip *chip, unsigned int dma_chan)
+static int dsp_dma_active(struct creative_chip *chip, unsigned int dma_chan)
 {
 	unsigned int reg = 0;
+	int ret;
 
-	creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &reg);
+	ret = creative_dsp_chipio_read(chip, DSPDMAC_CHNLSTART_INST_OFFSET, &reg);
+	if (chip->ae7 && ret)
+		return ret;
 	return (reg & (1 << (DSPDMAC_CHNLSTART_EN_LOBIT + dma_chan))) != 0;
 }
 
 /* Read the channel's active bit again 1 ms later, to confirm a first read. */
-static bool dsp_dma_active_again(struct creative_chip *chip,
-				 unsigned int dma_chan)
+static int dsp_dma_active_again(struct creative_chip *chip,
+				unsigned int dma_chan)
 {
 	usleep_range(1000, 1500);
-	return dsp_is_dma_active(chip, dma_chan);
+	return dsp_dma_active(chip, dma_chan);
 }
 
 static int dsp_dma_setup_common(struct creative_chip *chip,
@@ -2242,8 +2321,9 @@ static int dsp_dma_setup_common(struct creative_chip *chip,
 
 	if (dma_chan >= DSPDMAC_DMA_CFG_CHANNEL_COUNT)
 		return -EINVAL;
-	if (dsp_is_dma_active(chip, dma_chan))
-		return -EBUSY;
+	status = dsp_dma_active(chip, dma_chan);
+	if (status)
+		return status < 0 ? status : -EBUSY;
 	dsp_addx = dsp_chip_to_dsp_addx(chip_addx, &code, &yram);
 	if (dsp_addx == INVALID_CHIP_ADDX)
 		return -ENXIO;
@@ -2455,12 +2535,18 @@ static int dsp_allocate_router_ports(struct creative_chip *chip,
 	val = start_device << 6;
 	val |= (ports_per_channel - 1) << 4;
 	val |= num_chans - 1;
-	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_CONFIG_SET, val);
-	dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_SET, MEM_CONNID_DSP);
+	status = dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_CONFIG_SET, val);
+	if (chip->ae7 && status)
+		return status;
+	status = dsp_write(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_SET, MEM_CONNID_DSP);
+	if (chip->ae7 && status)
+		return status;
 	status = chipio_send(chip, VENDOR_CHIPIO_STATUS, 0);
 	if (status < 0)
 		return status;
 	res = dsp_read(chip, WIDGET_CHIP_CTRL, VENDOR_CHIPIO_PORT_ALLOC_GET, 0);
+	if (chip->ae7 && res < 0)
+		return -EIO;
 	*port_map = res;
 	return 0;
 }
@@ -2515,19 +2601,19 @@ static void dma_program(struct ae9_dma_engine *dma)
 	u32 ctl;
 
 	ctl = readl(sd + AZX_REG_SD_CTL) & ~SD_CTL_DMA_START;
-	writel((ctl | SD_CTL_STREAM_RESET) & SD_CTL_WMASK, sd + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (ctl | SD_CTL_STREAM_RESET) & SD_CTL_WMASK, sd + AZX_REG_SD_CTL);
 	wmb();
 	udelay(50);
-	writel((ctl & ~SD_CTL_STREAM_RESET) & SD_CTL_WMASK, sd + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (ctl & ~SD_CTL_STREAM_RESET) & SD_CTL_WMASK, sd + AZX_REG_SD_CTL);
 	wmb();
 	udelay(50);
 
-	writel((dma->stream_tag & 0xf) << 20, sd + AZX_REG_SD_CTL);
-	writel(dma->buf_size, sd + AZX_REG_SD_CBL);
-	writew(63, sd + AZX_REG_SD_LVI);	/* 64 BDL entries, as Windows */
-	writew(dma->hda_format, sd + AZX_REG_SD_FORMAT);
-	writel(lower_32_bits(dma->bdl_dma), sd + AZX_REG_SD_BDLPL);
-	writel(upper_32_bits(dma->bdl_dma), sd + AZX_REG_SD_BDLPU);
+	ae9_writel_flush(chip, (dma->stream_tag & 0xf) << 20, sd + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, dma->buf_size, sd + AZX_REG_SD_CBL);
+	ae9_writew_flush(chip, 63, sd + AZX_REG_SD_LVI);	/* 64 BDL entries, as Windows */
+	ae9_writew_flush(chip, dma->hda_format, sd + AZX_REG_SD_FORMAT);
+	ae9_writel_flush(chip, lower_32_bits(dma->bdl_dma), sd + AZX_REG_SD_BDLPL);
+	ae9_writel_flush(chip, upper_32_bits(dma->bdl_dma), sd + AZX_REG_SD_BDLPU);
 	wmb();
 }
 
@@ -2571,48 +2657,58 @@ static int dma_prepare(struct ae9_dma_engine *dma)
 	/* reset stream descriptor */
 	ctl = readl(chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL) & SD_CTL_WMASK;
 	ctl &= ~SD_CTL_DMA_START;
-	writel(ctl | SD_CTL_STREAM_RESET,
+	ae9_writel_flush(chip, ctl | SD_CTL_STREAM_RESET,
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 	wmb();
 	udelay(50);
-	writel(ctl & ~SD_CTL_STREAM_RESET,
+	ae9_writel_flush(chip, ctl & ~SD_CTL_STREAM_RESET,
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 	wmb();
 	udelay(50);
 
 	/* program descriptor: tag, CBL, LVI, format (16-bit!), BDL ptr */
-	writel((dma->stream_tag & 0xf) << 20,
+	ae9_writel_flush(chip, (dma->stream_tag & 0xf) << 20,
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
-	writel(dma->buf_size,
+	ae9_writel_flush(chip, dma->buf_size,
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CBL);
-	writew(63, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_LVI);
-	writew(dma->hda_format,
+	ae9_writew_flush(chip, 63, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_LVI);
+	ae9_writew_flush(chip, dma->hda_format,
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_FORMAT);
-	writel(lower_32_bits(dma->bdl_dma),
+	ae9_writel_flush(chip, lower_32_bits(dma->bdl_dma),
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_BDLPL);
-	writel(upper_32_bits(dma->bdl_dma),
+	ae9_writel_flush(chip, upper_32_bits(dma->bdl_dma),
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_BDLPU);
 	wmb();
 	return 0;
 }
 
-static void dma_cleanup(struct ae9_dma_engine *dma)
+static int dma_cleanup(struct ae9_dma_engine *dma)
 {
 	struct creative_chip *chip = dma->chip;
 	u32 ctl;
 
+	if (chip->ae7) {
+		if (!xfer_stream_stop(chip, DSPLOAD_STREAM_BASE, dma->stream_tag)) {
+			/* The controller may still have these addresses queued. */
+			pci_clear_master(chip->pci);
+			dev_err(chip->dev, "AE-7 firmware SD4 stuck; its DMA buffers were retained\n");
+			return -EIO;
+		}
+		goto free;
+	}
 	ctl = readl(chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL) & SD_CTL_WMASK;
-	writel(ctl & ~SD_CTL_DMA_START,
+	ae9_writel_flush(chip, ctl & ~SD_CTL_DMA_START,
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 	wmb();
 	/* Windows resets the download stream right after the transfer */
-	writel(SD_CTL_STREAM_RESET,
+	ae9_writel_flush(chip, SD_CTL_STREAM_RESET,
 	       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 	wmb();
 	udelay(50);
-	writel(0, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, 0, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 	wmb();
 	udelay(50);
+free:
 	if (dma->buf)
 		dma_free_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BUF_SIZE), dma->buf,
 				  dma->buf_dma);
@@ -2620,6 +2716,7 @@ static void dma_cleanup(struct ae9_dma_engine *dma)
 		dma_free_coherent(chip->dev, ae9_dma_size(chip, DSPLOAD_BDL_BYTES), dma->bdl,
 				  dma->bdl_dma);
 	dma->buf = dma->bdl = NULL;
+	return 0;
 }
 
 static void dma_run(struct ae9_dma_engine *dma, bool run)
@@ -2631,7 +2728,7 @@ static void dma_run(struct ae9_dma_engine *dma, bool run)
 		ctl |= SD_CTL_DMA_START;
 	else
 		ctl &= ~SD_CTL_DMA_START;
-	writel((ctl) & SD_CTL_WMASK, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (ctl) & SD_CTL_WMASK, chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 	wmb();
 }
 
@@ -2760,7 +2857,10 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 		status = dsp_dma_start(chip, dma_chan);
 		if (status < 0)
 			return status;
-		if (!dsp_is_dma_active(chip, dma_chan)) {
+		status = dsp_dma_active(chip, dma_chan);
+		if (status < 0)
+			return status;
+		if (!status) {
 			dev_warn(chip->dev, "dspxfr: DSP DMA did not start\n");
 			return -EIO;
 		}
@@ -2808,8 +2908,14 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 		do {
 			if (creative_ae9_gone(chip, "firmware chunk"))
 				return -ENODEV;
-			if (!dsp_is_dma_active(chip, dma_chan)) {
-				if (!dsp_dma_active_again(chip, dma_chan))
+			status = dsp_dma_active(chip, dma_chan);
+			if (status < 0)
+				return status;
+			if (!status) {
+				status = dsp_dma_active_again(chip, dma_chan);
+				if (status < 0)
+					return status;
+				if (!status)
 					break;
 				flicker++;
 			}
@@ -2828,8 +2934,12 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 		 * bring-up retry starts over, rather than carrying on. Two busy
 		 * reads in a row, for the same reason as above.
 		 */
-		if (dsp_is_dma_active(chip, dma_chan) &&
-		    dsp_dma_active_again(chip, dma_chan)) {
+		status = dsp_dma_active(chip, dma_chan);
+		if (status > 0)
+			status = dsp_dma_active_again(chip, dma_chan);
+		if (status < 0)
+			return status;
+		if (status) {
 			dev_warn(chip->dev,
 				 "dspxfr: chunk addx=0x%x (%u words) did not complete (LPIB %x->%x); failing the firmware load\n",
 				 chip_addx, run_size_words, lpib0, lpib1);
@@ -2852,13 +2962,14 @@ static int dspxfr_one_seg(struct creative_chip *chip,
 
 static int dspxfr_image(struct creative_chip *chip,
 			const struct ae9_dsp_image_seg *fls_data,
+			const struct ae9_dsp_image_seg *overlay,
 			unsigned int sample_rate, unsigned short channels)
 {
 	struct ae9_dma_engine dma;
 	unsigned short hda_format;
 	unsigned int response, port_map_mask = 0;
 	unsigned int dma_chan = 0;
-	int status;
+	int status, stop;
 
 	memset(&dma, 0, sizeof(dma));
 	dma.chip = chip;
@@ -2866,10 +2977,12 @@ static int dspxfr_image(struct creative_chip *chip,
 	dma.hda_format = hda_format;
 
 	/* set node 0x15 (chip ctrl) converter format */
-	verb_send(chip,
+	status = verb_send(chip,
 		creative_ae9_verb(CAD, WIDGET_CHIP_CTRL,
 				  VENDOR_CHIPIO_STREAM_FORMAT,
 				  hda_format & 0xffff), &response);
+	if (chip->ae7 && status)
+		return status;
 
 	status = dma_prepare(&dma);
 	dev_info(chip->dev, "dspxfr: dma_prepare ret=%d\n", status);
@@ -2877,15 +2990,20 @@ static int dspxfr_image(struct creative_chip *chip,
 		return status;
 
 	/* Windows binds node 0x15 to the load stream before allocating ports */
-	verb_send(chip,
+	status = verb_send(chip,
 		  creative_ae9_verb(CAD, WIDGET_CHIP_CTRL, 0x706,
 				    (dma.stream_tag << 4)), &response);
+	if (chip->ae7 && status)
+		goto exit;
 
 	status = dsp_allocate_ports_format(chip, hda_format, &port_map_mask);
 	dev_info(chip->dev, "dspxfr: alloc_ports ret=%d port_map_mask=0x%x\n",
 		 status, port_map_mask);
-	if (status < 0)
+	if (status < 0) {
+		if (chip->ae7)
+			goto unbind_stream;
 		goto exit;
+	}
 	/*
 	 * If the DSP is cold (no firmware running yet), port allocation
 	 * returns 0 because the ChipIO port allocator isn't initialised.
@@ -2900,7 +3018,7 @@ static int dspxfr_image(struct creative_chip *chip,
 	}
 
 	/* walk all FLS segments */
-	while (fls_data && !seg_is_last(fls_data)) {
+	while (fls_data && fls_data != overlay && !seg_is_last(fls_data)) {
 		if (fls_data->magic != FLS_MAGIC) {
 			dev_err(chip->dev, "FLS seg check fail\n");
 			status = -EINVAL;
@@ -2921,20 +3039,30 @@ static int dspxfr_image(struct creative_chip *chip,
 			fls_data = seg_next(fls_data);
 	}
 
+	if (chip->ae7 && status < 0 && !chip->card_gone) {
+		dma_run(&dma, false);
+		dsp_dma_stop(chip, dma_chan);
+	}
 	/* free the ports, then unbind, as Windows does (capture seq 4534-4538)
 	 * and upstream ca0132's dspxfr_image does */
-	verb_send(chip,
+	stop = verb_send(chip,
 		creative_ae9_verb(CAD, WIDGET_CHIP_CTRL,
 				  VENDOR_CHIPIO_PORT_FREE_SET, 0x10), &response);
-	verb_send(chip,
+	if (chip->ae7 && !status)
+		status = stop;
+unbind_stream:
+	stop = verb_send(chip,
 		creative_ae9_verb(CAD, WIDGET_CHIP_CTRL, 0x706, 0), &response);
+	if (chip->ae7 && !status)
+		status = stop;
 exit:
-	dma_cleanup(&dma);
-	return status;
+	stop = dma_cleanup(&dma);
+	return status ?: stop;
 }
 
 static int dspload_image(struct creative_chip *chip,
-			 const struct ae9_dsp_image_seg *fls)
+			 const struct ae9_dsp_image_seg *fls,
+			 const struct ae9_dsp_image_seg *overlay)
 {
 	unsigned int sample_rate = 48000;
 	unsigned short channels = DMA_TRANSFER_FRAME_SIZE_NWORDS;
@@ -2945,7 +3073,7 @@ static int dspload_image(struct creative_chip *chip,
 		channels /= 2;
 	}
 
-	status = dspxfr_image(chip, fls, sample_rate, channels);
+	status = dspxfr_image(chip, fls, overlay, sample_rate, channels);
 	if (status < 0)
 		return status;
 	dspload_post_setup(chip);
@@ -2954,6 +3082,8 @@ static int dspload_image(struct creative_chip *chip,
 		int r = dsp_set_run_state(chip);
 		int hs;
 
+		if (overlay && r)
+			return r;
 		/*
 		 * Windows waits 250 ms after starting the DSP before the first
 		 * handshake message (decompile FUN_0002859c:
@@ -2967,7 +3097,7 @@ static int dspload_image(struct creative_chip *chip,
 			msleep(2000);	/* Windows' wait for state 3 */
 			hs = -ETIMEDOUT;
 		} else {
-			hs = creative_dsp_boot_handshake(chip);
+			hs = dsp_boot_handshake(chip, overlay);
 		}
 
 		chip->hs_done = 1;
@@ -2975,6 +3105,8 @@ static int dspload_image(struct creative_chip *chip,
 		dev_info(chip->dev,
 			 "dspload: run ret=%d, immediate boot handshake %s (%d)\n",
 			 r, hs ? "INCOMPLETE" : "complete", hs);
+		if (overlay && hs)
+			return hs;
 		if (hs && dsp_fail_fast(chip))
 			return -EIO;
 		return r;
@@ -3173,11 +3305,44 @@ static void dsp_soft_reset(struct creative_chip *chip, unsigned int attempt,
 /* ------------------------------------------------------------------ */
 /* Public: download the DSP firmware					  */
 /* ------------------------------------------------------------------ */
+/* After fls_image_check(): the AE-7 desktop image carries the boot overlay
+ * after the HCI and three main segments. The overlay uses a different
+ * stream format and is sent only between handshake states 3 and 4. */
+static const struct ae9_dsp_image_seg *ae7_fls_overlay(const struct firmware *fw)
+{
+	static const struct {
+		u32 addr;
+		u32 count;
+	} layout[] = {
+		{ FLS_CHIP_ADDR_MAGIC, 12 },
+		{ 0x80020, 65528 },
+		{ 0, 61440 },
+		{ 0x40000, 36864 },
+		{ 0xb7b10, 78 },
+		{ 0x3f3a0, 21 },
+	};
+	const struct ae9_dsp_image_seg *seg = (const void *)fw->data;
+	const struct ae9_dsp_image_seg *overlay = NULL;
+	unsigned int i;
+
+	if (fw->size != AE7_DESKTOP_EFX_SIZE)
+		return NULL;
+	for (i = 0; i < ARRAY_SIZE(layout); i++, seg = seg_next(seg)) {
+		if (seg->chip_addr != layout[i].addr || seg->count != layout[i].count)
+			return NULL;
+		if (seg->chip_addr == 0xb7b10)
+			overlay = seg;
+	}
+	return seg_is_last(seg) ? overlay : NULL;
+}
+
 int creative_dsp_load_firmware(struct creative_chip *chip)
 {
+	const char *name = chip->ae7 ? AE7_DESKTOP_EFX_FILE : DESKTOP_EFX_FILE;
 	const struct firmware *fw;
 	const struct ae9_dsp_image_seg *fls;
-	unsigned int attempt, tries = AE9_DSP_SOFT_TRIES;
+	const struct ae9_dsp_image_seg *overlay = NULL;
+	unsigned int attempt, tries = chip->ae7 ? 1 : AE9_DSP_SOFT_TRIES;
 	unsigned long timeout;
 	int ret;
 
@@ -3225,16 +3390,27 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 	if (dspload_is_loaded(chip))
 		dev_info(chip->dev, "DSP firmware flag set from an earlier run: downloading anyway, as Windows\n");
 
-	ret = ae9_request_fw(chip, &fw, DESKTOP_EFX_FILE, DESKTOP_EFX_SIZE);
+	if (chip->ae7)
+		ret = request_firmware_direct(&fw, name, chip->dev);
+	else
+		ret = ae9_request_fw(chip, &fw, name, DESKTOP_EFX_SIZE);
 	if (ret < 0) {
 		dev_err(chip->dev, "firmware %s not found: %d\n",
-			DESKTOP_EFX_FILE, ret);
+			name, ret);
 		return ret;
 	}
 
-	if (fls_image_check(chip, fw, DESKTOP_EFX_FILE)) {
+	if (fls_image_check(chip, fw, name)) {
 		release_firmware(fw);
 		return -EINVAL;
+	}
+	if (chip->ae7) {
+		overlay = ae7_fls_overlay(fw);
+		if (!overlay) {
+			dev_err(chip->dev, "%s: unexpected AE-7 image layout\n", name);
+			release_firmware(fw);
+			return -EINVAL;
+		}
 	}
 	fls = (const struct ae9_dsp_image_seg *)fw->data;
 
@@ -3261,7 +3437,7 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 	for (attempt = 1; ; attempt++) {
 		/* fail fast (2 s handshake) while another download can follow */
 		chip->dsp_soft_left = tries - attempt;
-		ret = dspload_image(chip, fls);
+		ret = dspload_image(chip, fls, overlay);
 		chip->dsp_soft_left = 0;
 		dev_info(chip->dev, "dsp_load: dspload_image ret=%d (download %u of %u)\n",
 			 ret, attempt, tries);
@@ -3334,6 +3510,8 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 				dev_info(chip->dev,
 					 "SCP ready after %dms (sts=0x%x)\n",
 					 t * 10, dspio_sts);
+				if (chip->ae7 && t == 200)
+					return -ETIMEDOUT;
 			}
 			dspio_clear_response_queue(chip);
 			{
@@ -3347,8 +3525,15 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 			}
 			return 0;
 		}
+		if (chip->ae7 && creative_ae9_dead(chip))
+			return -ENODEV;
 		msleep(20);
 	} while (time_before(jiffies, timeout));
+
+	if (chip->ae7) {
+		dev_err(chip->dev, "AE-7 DSP firmware load not confirmed (0x40004 != 1)\n");
+		return -ETIMEDOUT;
+	}
 
 	/*
 	 * 0x40004 never became 1 — the 8051 started at a wrong PC due to a
@@ -3371,7 +3556,7 @@ int creative_dsp_load_firmware(struct creative_chip *chip)
 				creative_dsp_prepare(chip);
 				creative_dsp_chipio_write(chip, 0x40004, 0);
 				creative_dsp_chipio_write(chip, 0x801c,  0);
-				if (dspload_image(chip, fls2) == 0) {
+			if (dspload_image(chip, fls2, NULL) == 0) {
 					t2 = jiffies + msecs_to_jiffies(8000);
 					do {
 						if (dspload_is_loaded(chip)) {
@@ -3406,17 +3591,17 @@ int creative_dsp_prepare(struct creative_chip *chip)
 	{
 		u32 ctl = readl(chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL) & SD_CTL_WMASK;
 		/* Stop DMA */
-		writel(ctl & ~SD_CTL_DMA_START,
+		ae9_writel_flush(chip, ctl & ~SD_CTL_DMA_START,
 		       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 		wmb();
 		udelay(50);
 		/* Assert stream reset */
-		writel(ctl | SD_CTL_STREAM_RESET,
+		ae9_writel_flush(chip, ctl | SD_CTL_STREAM_RESET,
 		       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 		wmb();
 		udelay(100);
 		/* Deassert stream reset */
-		writel(ctl & ~(SD_CTL_DMA_START | SD_CTL_STREAM_RESET),
+		ae9_writel_flush(chip, ctl & ~(SD_CTL_DMA_START | SD_CTL_STREAM_RESET),
 		       chip->hda_regs + DSPLOAD_STREAM_BASE + AZX_REG_SD_CTL);
 		wmb();
 		udelay(50);

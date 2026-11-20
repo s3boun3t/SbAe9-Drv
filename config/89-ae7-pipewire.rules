@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Install in /etc/udev/rules.d/. WirePlumber combines the model name
+# with the mapping description from the dedicated ACP profile set.
+SUBSYSTEM=="sound", ACTION=="change", KERNEL=="card*", DRIVERS=="snd-hda-codec-creative-ae9", \
+  ATTRS{vendor}=="0x1102", ATTRS{device}=="0x0010", \
+  ATTRS{subsystem_vendor}=="0x1102", ATTRS{subsystem_device}=="0x0081", \
+  ENV{ACP_PROFILE_SET}="creative-ae7.conf", ENV{ID_MODEL_FROM_DATABASE}="Sound Blaster AE-7"

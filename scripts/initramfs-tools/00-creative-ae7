@@ -1,0 +1,35 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Install as an init-top script for the opt-in AE-7 experiment.
+# Verify the generated ORDER runs this before udev coldplug.
+
+case "${1-}" in
+	prereqs) exit 0 ;;
+esac
+
+driver=snd-hda-codec-creative-ae9
+found=
+
+for dev in /sys/bus/pci/devices/*; do
+	[ -L "$dev/driver" ] && continue
+	[ -r "$dev/driver_override" ] || continue
+	[ "$(cat "$dev/vendor")" = 0x1102 ] || continue
+	[ "$(cat "$dev/device")" = 0x0010 ] || continue
+	[ "$(cat "$dev/subsystem_vendor")" = 0x1102 ] || continue
+	[ "$(cat "$dev/subsystem_device")" = 0x0081 ] || continue
+
+	override=$(cat "$dev/driver_override") || continue
+	case "$override" in
+		""|"(null)")
+			printf '%s\n' "$driver" > "$dev/driver_override" ||
+				continue
+			;;
+		"$driver") ;;
+		*) continue ;;
+	esac
+	found=yes
+done
+
+if [ "$found" = yes ] && ! modprobe "$driver" ae7_claim=1; then
+	echo "creative-ae7: module load failed; retaining the PCI override" >&2
+fi

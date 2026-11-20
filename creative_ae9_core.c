@@ -23,6 +23,7 @@
 #include <linux/vmalloc.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
+#include <linux/iopoll.h>
 #include <sound/core.h>
 #include <sound/control.h>
 #include <sound/tlv.h>
@@ -37,6 +38,18 @@ MODULE_AUTHOR("3xHelix");
 MODULE_DESCRIPTION(CREATIVE_AE9_DRV_DESC);
 MODULE_LICENSE("GPL");
 MODULE_VERSION(CREATIVE_AE9_DRV_VERSION);
+
+static bool ae7_claim;
+module_param(ae7_claim, bool, 0444);
+MODULE_PARM_DESC(ae7_claim, "Opt in to the experimental AE-7 PCI probe");
+
+static bool ae7_codec_check;
+module_param(ae7_codec_check, bool, 0444);
+MODULE_PARM_DESC(ae7_codec_check, "Check the AE-7 codec over ICW and CORB, then stop (requires ae7_claim)");
+
+static bool ae7_dsp;
+module_param(ae7_dsp, bool, 0444);
+MODULE_PARM_DESC(ae7_dsp, "Enable experimental AE-7 DSP headphone playback (requires ae7_claim)");
 
 /* seconds after a bring-up during which phantom power "on" is refused */
 #define AE9_PHANTOM_HOLD_S	30
@@ -133,11 +146,12 @@ struct vlog_ent { u32 val; u32 ex; u64 ns; };	/* ns: ktime, for timing diffs */
 static struct vlog_ent *vlog_buf;
 static atomic_t vlog_n = ATOMIC_INIT(0);
 
-void creative_ae9_vlog(u32 val, u32 ex, bool is_resp)
+void creative_ae9_vlog(struct creative_chip *chip, u32 val, u32 ex,
+		      bool is_resp)
 {
 	int i;
 
-	if (!vlog_buf)
+	if (chip->ae7 || !vlog_buf)
 		return;
 	i = atomic_inc_return(&vlog_n) - 1;
 	if (i >= (int)verb_log)
@@ -234,13 +248,15 @@ DEFINE_SEQ_ATTRIBUTE(vlog_seq);
 /* PCI device ID table						  */
 /* ------------------------------------------------------------------ */
 /*
- * AE-9 only: 1102:0010 with subsystem 1102:0071. The same device ID is used
- * by the AE-7 and AE-5 (other subsystem IDs); they must not get the AE-9
- * bus reset and Windows replay. Other Creative device IDs aren't claimed.
+ * 1102:0010 is shared by several cards. The subsystem ID selects the
+ * board, since the AE-9 reset and Windows sequence are board-specific.
  */
 static const struct pci_device_id creative_ae9_pci_tbl[] = {
 	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_CREATIVE, DEVICE_AE7_AE9,
 			 PCI_VENDOR_ID_CREATIVE, CREATIVE_SUBSYS_AE9),
+	  .driver_data = DEVICE_AE7_AE9 },
+	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_CREATIVE, DEVICE_AE7_AE9,
+			 PCI_VENDOR_ID_CREATIVE, CREATIVE_SUBSYS_AE7),
 	  .driver_data = DEVICE_AE7_AE9 },
 	{ }
 };
@@ -317,16 +333,19 @@ int creative_ae9_icw_send_verb(struct creative_chip *chip,
 	wmb();
 
 	/* Step 2: Write verb to ICW */
-	creative_ae9_vlog(verb, 0, false);
+	creative_ae9_vlog(chip, verb, 0, false);
 	creative_hda_writel(chip, AZX_REG_IC, verb);
 
 	/* Step 3: Poll IRS == 0x4 (command accepted, ready to fire) */
-	timeout = CREATIVE_IC_CMD_TIMEOUT_MS;
+	timeout = chip->ae7 ? 1000 : CREATIVE_IC_CMD_TIMEOUT_MS;
 	do {
 		irs = creative_hda_readw(chip, AZX_REG_IRS);
 		if (irs == 0x4)
 			break;
-		udelay(10);
+		if (chip->ae7)
+			usleep_range(50, 100);
+		else
+			udelay(10);
 	} while (--timeout);
 
 	if (!timeout) {
@@ -341,12 +360,15 @@ int creative_ae9_icw_send_verb(struct creative_chip *chip,
 	creative_hda_writew(chip, AZX_REG_IRS, 0x5);
 
 	/* Step 5: Poll for VALID bit */
-	timeout = CREATIVE_IC_CMD_TIMEOUT_MS;
+	timeout = chip->ae7 ? 1000 : CREATIVE_IC_CMD_TIMEOUT_MS;
 	do {
 		irs = creative_hda_readw(chip, AZX_REG_IRS);
 		if (irs & AZX_IRS_VALID)
 			break;
-		udelay(10);
+		if (chip->ae7)
+			usleep_range(50, 100);
+		else
+			udelay(10);
 	} while (--timeout);
 
 	if (!timeout) {
@@ -359,7 +381,7 @@ int creative_ae9_icw_send_verb(struct creative_chip *chip,
 	{
 		u32 r = creative_hda_readl(chip, AZX_REG_IR);
 
-		creative_ae9_vlog(r, verb >> 28, true);
+		creative_ae9_vlog(chip, r, verb >> 28, true);
 		if (resp)
 			*resp = r;
 	}
@@ -4500,7 +4522,6 @@ static int dma_pad = -1;
 
 /* posted_flush: -1 = auto (on behind an ASMedia bridge), 0 = off, 1 = on;
  * see creative_ae9.h */
-bool ae9_posted_flush;
 static int posted_flush = -1;
 module_param(posted_flush, int, 0444);
 MODULE_PARM_DESC(posted_flush, "Read back after every register write, as Windows: -1 = auto (ASMedia bridge, default), 0 = off, 1 = on");
@@ -4800,7 +4821,7 @@ static int creative_ae9_hw_bringup(struct creative_chip *chip)
 	 * the DSP I2C init's CMD=0x30 re-init cuts off the head unit */
 	if (!chip->dsp_done) {
 		dev_info(chip->dev, "init: stream enable\n");
-		writeb(0x3f, chip->ext_regs + CREATIVE_REG_STREAM_ENABLE);
+		ae9_writeb_flush(chip, 0x3f, chip->ext_regs + CREATIVE_REG_STREAM_ENABLE);
 		wmb();
 	}
 
@@ -4867,6 +4888,305 @@ static void creative_ae9_destroy_wq(void *wq)
 	destroy_workqueue(wq);
 }
 
+static void creative_configure_bridge(struct creative_chip *chip)
+{
+	struct pci_dev *pdev = chip->pci;
+
+	if (pdev->bus->self && pdev->bus->self->vendor == PCI_VENDOR_ID_ASMEDIA &&
+	    pdev->bus->self->device == 0x1080)
+		chip->asmedia = true;
+	chip->dma_pad = (dma_pad < 0 ? (chip->asmedia ? 64 : 0) : dma_pad) * 1024;
+	chip->posted_flush = posted_flush < 0 ? chip->asmedia : !!posted_flush;
+	if (chip->posted_flush)
+		dev_info(chip->dev, "posted_flush: every register write is read back (%s)\n",
+			 posted_flush < 0 ? "ASMedia bridge" : "posted_flush=1");
+	if (chip->asmedia || chip->dma_pad)
+		dev_info(chip->dev, "bridge %s%s: %zu KB spare after each DMA buffer\n",
+			 pdev->bus->self ? pci_name(pdev->bus->self) : "-",
+			 chip->asmedia ? " (ASMedia ASM1083/1085)" : "",
+			 chip->dma_pad / 1024);
+}
+
+static void creative_init_transport(struct creative_chip *chip)
+{
+	chip->r51_sel = -1;
+	chip->rirb_send_wp = -1;
+	chip->rirb_wp0 = -1;
+	chip->rirb_held = -1;
+	spin_lock_init(&chip->lock);
+	mutex_init(&chip->corb_mutex);
+	mutex_init(&chip->r51_mutex);
+	mutex_init(&chip->scp_mutex);
+	mutex_init(&chip->replay_mutex);
+	mutex_init(&chip->ca0113_mutex);
+	INIT_WORK(&chip->dead_work, creative_ae9_dead_work);
+}
+
+static int creative_ae7_check_codec(struct creative_chip *chip, bool corb)
+{
+	static const struct {
+		u32 verb;
+		u32 expected;
+	} id[] = {
+		{ 0x100f0000, 0x11020011 },	/* CAD 1, root vendor ID */
+		{ 0x101f2000, 0x11020081 },	/* AFG subsystem ID */
+	};
+	const char *transport = corb ? "CORB/RIRB" : "ICW";
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(id); i++) {
+		u32 response = 0;
+		int ret;
+
+		if (corb)
+			ret = creative_ae9_corb_send_verb_sync(chip, id[i].verb,
+							      &response);
+		else
+			ret = creative_ae9_icw_send_verb(chip, id[i].verb,
+							&response);
+		if (ret || response != id[i].expected) {
+			dev_err(chip->dev,
+				"AE-7 %s verb %#010x: ret %d, response %#010x, expected %#010x\n",
+				transport, id[i].verb, ret, response, id[i].expected);
+			return ret ?: -ENODEV;
+		}
+	}
+
+	dev_info(chip->dev, "AE-7 %s codec 11020011, subsystem 11020081\n",
+		 transport);
+	return 0;
+}
+
+static int creative_ae7_hw_start(struct creative_chip *chip, bool codec_only)
+{
+	const char *step = "BAR2 preparation";
+	int ret;
+
+	if (creative_ae9_gone(chip, "AE-7 start"))
+		return -ENODEV;
+	ret = creative_ae7_prepare_bar2(chip);
+	if (ret)
+		goto fail;
+
+	step = "controller reset";
+	ret = creative_ae9_hw_reset(chip);
+	if (ret)
+		goto fail;
+	msleep(15);	/* Windows waits a tick before the ICW exchange */
+	chip->codec_mask = creative_hda_readw(chip, AZX_REG_STATESTS);
+	if (!(chip->codec_mask & BIT(1)) || chip->codec_mask == U16_MAX) {
+		dev_err(chip->dev, "AE-7 codec 1 unavailable (STATESTS=%#06x)\n",
+			chip->codec_mask);
+		ret = -ENODEV;
+		goto fail;
+	}
+	creative_hda_writeb(chip, AZX_REG_CORBCTL, 0);
+	creative_hda_writeb(chip, AZX_REG_RIRBCTL, 0);
+	creative_hda_writeb(chip, AZX_REG_IRS, 5);
+	creative_hda_writeb(chip, AZX_REG_IRS, 0);
+	creative_hda_writeb(chip, AZX_REG_IRS, 4);
+	chip->last_irs_ack = 6;
+
+	step = "ICW identification";
+	ret = creative_ae7_check_codec(chip, false);
+	if (ret)
+		goto fail;
+
+	step = "CORB/RIRB identification";
+	/* Windows resets GCTL again between the ICW and ring probes. */
+	ret = creative_ae9_hw_reset(chip);
+	if (ret)
+		goto fail;
+	/* GCTL and the codec's unsolicited-enable verb gate SCP replies. */
+	creative_hda_writel(chip, AZX_REG_GCTL, AZX_GCTL_RESET | AZX_GCTL_UNSOL);
+	pci_set_master(chip->pci);
+	/* The shared IRQ may now acknowledge RIRB; PCM still needs dsp_done. */
+	chip->unsol_parked = false;
+	WRITE_ONCE(chip->suspended, false);
+	ret = creative_ae9_corb_init(chip);
+	if (ret)
+		goto fail;
+	ret = creative_ae7_check_codec(chip, true);
+	if (ret)
+		goto fail;
+	if (codec_only)
+		return 0;
+
+	step = "pre-download";
+	ret = creative_ae7_pre_download(chip);
+	if (ret)
+		goto fail;
+	step = "firmware and boot handshake";
+	ret = creative_dsp_load_firmware(chip);
+	if (ret)
+		goto fail;
+	step = "headphone route";
+	ret = creative_ae7_route_headphones(chip);
+	if (ret)
+		goto fail;
+	smp_store_release(&chip->dsp_done, 1);
+	dev_info(chip->dev, "AE-7 DSP and headphone route ready\n");
+	return 0;
+
+fail:
+	dev_err(chip->dev, "AE-7 %s failed: %d\n", step, ret);
+	return ret;
+}
+
+/* PCM suspended (or never published). Serialise against prepare/hw_free. */
+static void creative_ae7_hw_stop(struct creative_chip *chip)
+{
+	unsigned int base = chip->playback_stream_base;
+	u32 ctl;
+
+	WRITE_ONCE(chip->suspended, true);
+	mutex_lock(&chip->replay_mutex);
+	WRITE_ONCE(chip->dsp_done, 0);
+	if (!chip->card_gone)
+		creative_hda_writel(chip, AZX_REG_INTCTL, 0);
+	synchronize_irq(chip->irq);
+	if (!chip->card_gone) {
+		creative_ae7_mute_headphones(chip);
+		ctl = creative_hda_readl(chip, base + AZX_REG_SD_CTL);
+		creative_hda_writel(chip, base + AZX_REG_SD_CTL,
+				    ctl & SD_CTL_WMASK &
+				    ~(SD_CTL_DMA_START | 0x1c));
+		if (read_poll_timeout(creative_hda_readl, ctl,
+				      !(ctl & SD_CTL_DMA_START), 10, 10000,
+				      false, chip, base + AZX_REG_SD_CTL))
+			dev_warn(chip->dev, "AE-7 SD4 did not stop\n");
+		creative_ae9_corb_free(chip);
+	}
+	pci_clear_master(chip->pci);
+	chip->pcm_start_sent = 0;
+	WRITE_ONCE(chip->pb_format, 0);
+	mutex_unlock(&chip->replay_mutex);
+	cancel_work_sync(&chip->dead_work);
+}
+
+static void creative_ae7_stop_card(struct creative_chip *chip)
+{
+	snd_power_change_state(chip->card, SNDRV_CTL_POWER_D3hot);
+	WRITE_ONCE(chip->suspended, true);
+	snd_pcm_suspend_all(chip->pcm);
+	creative_ae7_hw_stop(chip);
+}
+
+static int creative_ae7_audio_probe(struct pci_dev *pdev, void __iomem *hda)
+{
+	struct device *dev = &pdev->dev;
+	struct creative_chip *chip;
+	int ret;
+
+	if (pci_resource_len(pdev, 0) < 0x200 ||
+	    pci_resource_len(pdev, 2) < 0x4000)
+		return -ENODEV;
+
+	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
+	if (!chip)
+		return -ENOMEM;
+	chip->ae7 = true;
+	chip->pci = pdev;
+	chip->dev = dev;
+	chip->hda_regs = hda;
+	chip->ext_regs = pcim_iomap_region(pdev, 2, CREATIVE_AE9_DRV_NAME);
+	if (IS_ERR(chip->ext_regs))
+		return PTR_ERR(chip->ext_regs);
+	chip->suspended = true;
+	chip->irq = pdev->irq;
+	chip->playback_stream_base = 0x100;	/* SD4 */
+	creative_configure_bridge(chip);
+	creative_init_transport(chip);
+
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return ret;
+	ret = devm_request_irq(dev, chip->irq, creative_ae9_irq_handler,
+			       IRQF_SHARED, CREATIVE_AE9_DRV_NAME, chip);
+	if (ret)
+		return ret;
+
+	ret = creative_ae7_hw_start(chip, ae7_codec_check);
+	if (ret || ae7_codec_check)
+		goto err_hw;
+	ret = snd_card_new(dev, SNDRV_DEFAULT_IDX1, "AE7", THIS_MODULE, 0,
+			   &chip->card);
+	if (ret)
+		goto err_hw;
+	strscpy(chip->card->driver, "SB-AE7", sizeof(chip->card->driver));
+	strscpy(chip->card->shortname, "Sound Blaster AE-7",
+		sizeof(chip->card->shortname));
+	snprintf(chip->card->longname, sizeof(chip->card->longname),
+		 "Creative Sound Blaster AE-7 at %s", pci_name(pdev));
+	chip->card->sync_irq = chip->irq;
+
+	ret = creative_ae7_pcm_init(chip);
+	if (ret)
+		goto err_card;
+	ret = snd_card_register(chip->card);
+	if (ret)
+		goto err_card;
+	pci_set_drvdata(pdev, chip);
+	dev_info(dev, "AE-7 headphone PCM registered as %s\n", chip->card->id);
+	return 0;
+
+err_card:
+	creative_ae7_hw_stop(chip);
+	snd_card_free(chip->card);
+	goto err_irq;
+err_hw:
+	creative_ae7_hw_stop(chip);
+err_irq:
+	devm_free_irq(dev, chip->irq, chip);
+	return ret;
+}
+
+static int creative_ae7_probe(struct pci_dev *pdev)
+{
+	void __iomem *hda;
+	u16 gcap, statests;
+	int ret;
+
+	if (!ae7_claim)
+		return -ENODEV;
+
+	/*
+	 * Keep the opted-in device bound if diagnostics fail. The generic
+	 * HDA probe can hang on the ASM1085 board. Leave drvdata unset
+	 * unless the audio path has been initialised.
+	 */
+	ret = pcim_enable_device(pdev);
+	if (ret < 0) {
+		dev_warn(&pdev->dev, "AE-7 claimed; PCI enable failed: %d\n",
+			 ret);
+		return 0;
+	}
+
+	if (pci_resource_len(pdev, 0) < AZX_REG_STATESTS + sizeof(statests)) {
+		dev_warn(&pdev->dev, "AE-7 claimed; HDA BAR0 is too small\n");
+		return 0;
+	}
+
+	hda = pcim_iomap_region(pdev, 0, CREATIVE_AE9_DRV_NAME);
+	if (IS_ERR(hda)) {
+		dev_warn(&pdev->dev, "AE-7 claimed; HDA BAR0 mapping failed: %pe\n",
+			 hda);
+		return 0;
+	}
+
+	gcap = readw(hda + AZX_REG_GCAP);
+	statests = readw(hda + AZX_REG_STATESTS);
+	dev_info(&pdev->dev, "AE-7 claimed: GCAP=%#06x STATESTS=%#06x (no PCM)\n",
+		 gcap, statests);
+	if (ae7_dsp || ae7_codec_check) {
+		ret = creative_ae7_audio_probe(pdev, hda);
+		if (ret)
+			dev_err(&pdev->dev, "AE-7 audio probe failed: %d; retaining PCI claim\n",
+				ret);
+	}
+	return 0;
+}
+
 static int creative_ae9_probe(struct pci_dev *pdev,
 			      const struct pci_device_id *ent)
 {
@@ -4874,13 +5194,18 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	struct creative_chip *chip;
 	int ret;
 
-	/* Look up BAR layout for this device variant */
-	if (ent->driver_data >= ARRAY_SIZE(creative_ae9_bar_layouts)) {
-		dev_err(&pdev->dev, "Unknown device variant %lu\n",
-			(unsigned long)ent->driver_data);
+	/* driver_override can reach probe with a dummy PCI ID entry. */
+	if (pdev->vendor != PCI_VENDOR_ID_CREATIVE ||
+	    pdev->device != DEVICE_AE7_AE9 ||
+	    pdev->subsystem_vendor != PCI_VENDOR_ID_CREATIVE)
 		return -ENODEV;
-	}
-	layout = &creative_ae9_bar_layouts[ent->driver_data];
+	if (pdev->subsystem_device == CREATIVE_SUBSYS_AE7)
+		return creative_ae7_probe(pdev);
+	if (pdev->subsystem_device != CREATIVE_SUBSYS_AE9 ||
+	    ent->driver_data != DEVICE_AE7_AE9)
+		return -ENODEV;
+
+	layout = &creative_ae9_bar_layouts[DEVICE_AE7_AE9];
 
 	ret = pcim_enable_device(pdev);
 	if (ret < 0) {
@@ -4931,26 +5256,9 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
 		return -ENOMEM;
-	chip->r51_sel = -1;	/* no router-chip parameter selected yet */
-	chip->rirb_send_wp = -1;
-	chip->rirb_wp0 = -1;
-	chip->rirb_held = -1;
-
 	chip->pci = pdev;
 	chip->dev = &pdev->dev;
-	if (pdev->bus->self && pdev->bus->self->vendor == PCI_VENDOR_ID_ASMEDIA &&
-	    pdev->bus->self->device == 0x1080)
-		chip->asmedia = true;
-	chip->dma_pad = (dma_pad < 0 ? (chip->asmedia ? 64 : 0) : dma_pad) * 1024;
-	ae9_posted_flush = posted_flush < 0 ? chip->asmedia : !!posted_flush;
-	if (ae9_posted_flush)
-		dev_info(&pdev->dev, "posted_flush: every register write is read back (%s)\n",
-			 posted_flush < 0 ? "ASMedia bridge" : "posted_flush=1");
-	if (chip->asmedia || chip->dma_pad)
-		dev_info(&pdev->dev, "bridge %s%s: %zu KB spare after each DMA buffer\n",
-			 pdev->bus->self ? pci_name(pdev->bus->self) : "-",
-			 chip->asmedia ? " (ASMedia ASM1083/1085)" : "",
-			 chip->dma_pad / 1024);
+	creative_configure_bridge(chip);
 	chip->hu_phantom_req = -1;	/* nothing to send */
 	/* before the bring-up: its post-boot replay sends "AE-9" only with the
 	 * display on (set later, in hu_controls_add, it blanked "AE-9" at
@@ -4961,12 +5269,7 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	chip->ext_regs = pcim_iomap_table(pdev)[layout->ext_bar];
 	vlog_bar0 = chip->hda_regs;
 	vlog_bar2 = chip->ext_regs;
-	spin_lock_init(&chip->lock);
-	mutex_init(&chip->corb_mutex);
-	mutex_init(&chip->r51_mutex);
-	mutex_init(&chip->scp_mutex);
-	mutex_init(&chip->replay_mutex);
-	mutex_init(&chip->ca0113_mutex);
+	creative_init_transport(chip);
 	mutex_init(&chip->spdif_mutex);
 	mutex_init(&chip->dsd_mutex);
 	init_waitqueue_head(&chip->dsd_wq);
@@ -5002,7 +5305,6 @@ static int creative_ae9_probe(struct pci_dev *pdev,
 	INIT_DELAYED_WORK(&chip->hb_work, creative_ae9_hb_work);
 	INIT_DELAYED_WORK(&chip->dsd_mute_work, creative_ae9_dsd_mute_work);
 	INIT_WORK(&chip->resume_work, creative_ae9_resume_work);
-	INIT_WORK(&chip->dead_work, creative_ae9_dead_work);
 	atomic_set(&chip->dma_running, 0);
 
 	dev_info(chip->dev,
@@ -5136,7 +5438,7 @@ static irqreturn_t creative_ae9_irq_handler(int irq, void *dev_id)
 	u32 intsts;
 	u8 rirbsts;
 
-	if (chip->suspended)
+	if (READ_ONCE(chip->suspended))
 		return IRQ_NONE;
 	intsts = readl(chip->hda_regs + AZX_REG_INTSTS);
 
@@ -5155,13 +5457,13 @@ static irqreturn_t creative_ae9_irq_handler(int irq, void *dev_id)
 			 * boot handshake on resume (at probe the IRQ isn't
 			 * registered yet, so it never showed).
 			 */
-			writeb(rirbsts | RIRB_INT_RESPONSE,
+			ae9_writeb_flush(chip, rirbsts | RIRB_INT_RESPONSE,
 			       chip->hda_regs + AZX_REG_RIRBSTS);
 			wmb();
 		}
 		if (rirbsts & RIRB_INT_OVERRUN) {
 			/* Clear overrun, then resync RIRB */
-			writeb(rirbsts | RIRB_INT_OVERRUN,
+			ae9_writeb_flush(chip, rirbsts | RIRB_INT_OVERRUN,
 			       chip->hda_regs + AZX_REG_RIRBSTS);
 			wmb();
 		}
@@ -5169,18 +5471,19 @@ static irqreturn_t creative_ae9_irq_handler(int irq, void *dev_id)
 
 	/* input streams: 0 capture (XLR), 1 optical in, 2 What U Hear,
 	 * 3 rear RCA in */
-	if (intsts & 0x1)
-		creative_ae9_cap_irq(chip);
-	if (intsts & 0x2)
-		creative_ae9_xcap_irq(chip, 0);
-	if (intsts & 0x4)
-		creative_ae9_xcap_irq(chip, 1);
-	if (intsts & 0x8)
-		creative_ae9_xcap_irq(chip, 2);
-
-	/* separate optical playback: stream descriptor 6 (0x140, bit 6) */
-	if (intsts & BIT(6))
-		creative_ae9_opt_irq(chip);
+	if (!chip->ae7) {
+		if (intsts & 0x1)
+			creative_ae9_cap_irq(chip);
+		if (intsts & 0x2)
+			creative_ae9_xcap_irq(chip, 0);
+		if (intsts & 0x4)
+			creative_ae9_xcap_irq(chip, 1);
+		if (intsts & 0x8)
+			creative_ae9_xcap_irq(chip, 2);
+		/* optical playback: SD6 */
+		if (intsts & BIT(6))
+			creative_ae9_opt_irq(chip);
+	}
 
 	/*
 	 * Main playback: its own descriptor's bit only (0x100 = bit 4). This
@@ -5189,20 +5492,25 @@ static irqreturn_t creative_ae9_irq_handler(int irq, void *dev_id)
 	 * headphone-profile transfers (SD4/SD5) set no INTCTL bit.
 	 */
 	if (intsts & BIT((chip->playback_stream_base - 0x80) / 0x20)) {
+		struct snd_pcm_substream *substream;
 		u8 sd_sts = readb(chip->hda_regs +
 				  chip->playback_stream_base + AZX_REG_SD_STS);
 		if (sd_sts & SD_INT_COMPLETE) {
 			/* W1C: clear completion interrupt */
-			writeb(SD_INT_COMPLETE, chip->hda_regs +
+			ae9_writeb_flush(chip, SD_INT_COMPLETE, chip->hda_regs +
 			       chip->playback_stream_base + AZX_REG_SD_STS);
 			wmb();
 			/* Notify ALSA that a period has completed */
-			if (chip->playback_substream)
-				snd_pcm_period_elapsed(chip->playback_substream);
+			substream = READ_ONCE(chip->playback_substream);
+			if (substream)
+				snd_pcm_period_elapsed(substream);
 		}
 		/* Clear any error bits */
 		if (sd_sts & (SD_INT_FIFO_ERR | SD_INT_DESC_ERR)) {
-			writeb(sd_sts & SD_INT_MASK, chip->hda_regs +
+			if (chip->ae7)
+				dev_warn_ratelimited(chip->dev,
+						     "AE-7 SD4 DMA error: %#x\n", sd_sts);
+			ae9_writeb_flush(chip, sd_sts & SD_INT_MASK, chip->hda_regs +
 			       chip->playback_stream_base + AZX_REG_SD_STS);
 			wmb();
 		}
@@ -5272,9 +5580,9 @@ static void creative_ae9_win_shutdown(struct creative_chip *chip, const char *wh
 	dev_info(chip->dev, "shutdown (%s): Windows power-down sequence\n", why);
 	/* stop capture (SD0) and playback (SD4) DMA */
 	ctl = readl(chip->hda_regs + 0x80 + AZX_REG_SD_CTL);
-	writel((ctl & ~SD_CTL_DMA_START) & SD_CTL_WMASK, chip->hda_regs + 0x80 + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (ctl & ~SD_CTL_DMA_START) & SD_CTL_WMASK, chip->hda_regs + 0x80 + AZX_REG_SD_CTL);
 	ctl = readl(chip->hda_regs + 0x100 + AZX_REG_SD_CTL);
-	writel((ctl & ~SD_CTL_DMA_START) & SD_CTL_WMASK, chip->hda_regs + 0x100 + AZX_REG_SD_CTL);
+	ae9_writel_flush(chip, (ctl & ~SD_CTL_DMA_START) & SD_CTL_WMASK, chip->hda_regs + 0x100 + AZX_REG_SD_CTL);
 
 	if (chip->corb_buf) {
 		/* the AFGs go to D3cold (705 p=4) only at power-off; Windows
@@ -5290,9 +5598,9 @@ static void creative_ae9_win_shutdown(struct creative_chip *chip, const char *wh
 	} else {
 		dev_info(chip->dev, "shutdown: command ring not running, skipping the sequence\n");
 	}
-	writel(0x40000000, chip->hda_regs + AZX_REG_INTCTL);
+	ae9_writel_flush(chip, 0x40000000, chip->hda_regs + AZX_REG_INTCTL);
 	creative_ae9_corb_free(chip);
-	writel(0x100, chip->hda_regs + AZX_REG_GCTL);	/* controller in reset */
+	ae9_writel_flush(chip, 0x100, chip->hda_regs + AZX_REG_GCTL);	/* controller in reset */
 	chip->dsp_done = 0;
 	chip->dsp_active = false;
 	dev_info(chip->dev, "shutdown (%s): done\n", why);
@@ -5344,6 +5652,11 @@ static void creative_ae9_shutdown(struct pci_dev *pdev)
 
 	if (!chip || chip->suspended)
 		return;
+	if (chip->ae7) {
+		creative_ae9_set_unloading(chip);
+		creative_ae7_stop_card(chip);
+		return;
+	}
 	creative_ae9_set_unloading(chip);
 	creative_ae9_stop_works(chip);
 	creative_ae9_dsd_abort(chip, "reboot/power-off");	/* native DSD (pcm_dsd) off */
@@ -5359,6 +5672,13 @@ static void creative_ae9_remove(struct pci_dev *pdev)
 		return;
 
 	creative_ae9_set_unloading(chip);
+	if (chip->ae7) {
+		snd_card_disconnect(chip->card);
+		if (!chip->suspended)
+			creative_ae7_stop_card(chip);
+		snd_card_free(chip->card);
+		return;
+	}
 	/* fx_remove first: after it an hp_custom write can't queue hp_work */
 	creative_ae9_fx_remove(chip);
 	creative_ae9_stop_works(chip);
@@ -5413,6 +5733,10 @@ static int creative_ae9_suspend(struct device *dev)
 
 	if (!chip)
 		return 0;
+	if (chip->ae7) {
+		creative_ae7_stop_card(chip);
+		return 0;
+	}
 	cancel_work_sync(&chip->resume_work);
 	cancel_work_sync(&chip->dead_work);
 	snd_power_change_state(chip->card, SNDRV_CTL_POWER_D3hot);
@@ -5426,7 +5750,7 @@ static int creative_ae9_suspend(struct device *dev)
 	cancel_delayed_work_sync(&chip->hp_work);
 	chip->dsp_active = false;
 	chip->suspended = true;
-	writel(0, chip->hda_regs + AZX_REG_INTCTL);
+	ae9_writel_flush(chip, 0, chip->hda_regs + AZX_REG_INTCTL);
 	creative_ae9_corb_free(chip);
 	/* GPIO back to its cold power-on value (speakers mode leaves 0x103,
 	 * headphones 0x003); in case the card keeps it through the sleep */
@@ -5542,7 +5866,29 @@ static void creative_ae9_resume_work(struct work_struct *work)
 static int creative_ae9_resume(struct device *dev)
 {
 	struct creative_chip *chip = dev_get_drvdata(dev);
+	int ret;
 
+	if (chip && chip->ae7) {
+		mutex_lock(&chip->replay_mutex);
+		chip->card_gone = !pci_device_is_present(chip->pci);
+		chip->card_hung = false;
+		chip->corb_to_run = 0;
+		atomic_set(&chip->scp_unsol, 0);
+		chip->scp_unsol_done = 0;
+		chip->hs_ok = false;
+		chip->hs_done = false;
+		chip->dsp_halted = false;
+		chip->overlay_sent = false;
+		ret = creative_ae7_hw_start(chip, false);
+		mutex_unlock(&chip->replay_mutex);
+		if (ret) {
+			creative_ae7_hw_stop(chip);
+			dev_err(dev, "AE-7 resume failed, headphone PCM unavailable: %d\n",
+				ret);
+		}
+		snd_power_change_state(chip->card, SNDRV_CTL_POWER_D0);
+		return 0;
+	}
 	if (chip)
 		queue_work(chip->wq, &chip->resume_work);
 	return 0;

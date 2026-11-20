@@ -118,7 +118,7 @@ int creative_ae9_corb_init(struct creative_chip *chip)
 	udelay(1);
 	creative_hda_writeb(chip, CA0132_ICS, 0x04);
 	udelay(10);
-	writew(0x06, chip->hda_regs + CA0132_ICS);
+	ae9_writew_flush(chip, 0x06, chip->hda_regs + CA0132_ICS);
 	wmb();
 	udelay(10);
 
@@ -334,21 +334,21 @@ int creative_ae9_corb_send_verb(struct creative_chip *chip, u32 verb)
 	/* Ensure verb is written to DMA buffer before updating WP */
 	wmb();
 
-	creative_ae9_vlog(verb, 0, false);
+	creative_ae9_vlog(chip, verb, 0, false);
 
 	/* Update CORB write pointer — this triggers the controller */
-	writew(next_wp, chip->hda_regs + AZX_REG_CORBWP);
+	ae9_writew_flush(chip, next_wp, chip->hda_regs + AZX_REG_CORBWP);
 	wmb();
 
 	/* CORBCTL = 0x03 (CORBRUN + memory-error interrupt) after every
 	 * CORBWP advance, as the Windows capture does. Only the first one
 	 * changes anything (it starts the CORB DMA); later ones are no-ops.
 	 */
-	writeb(CORBCTL_RUN, chip->hda_regs + AZX_REG_CORBCTL);
+	ae9_writeb_flush(chip, CORBCTL_RUN, chip->hda_regs + AZX_REG_CORBCTL);
 	wmb();
 
 	/* Acknowledge any pending RIRB status (W1C, matches capture) */
-	writeb(0x05, chip->hda_regs + AZX_REG_RIRBSTS);
+	ae9_writeb_flush(chip, 0x05, chip->hda_regs + AZX_REG_RIRBSTS);
 
 	chip->corb_wp = next_wp;
 
@@ -367,7 +367,7 @@ int creative_ae9_corb_send_verb(struct creative_chip *chip, u32 verb)
  */
 static void rirb_unsol(struct creative_chip *chip, u32 res, u32 fl)
 {
-	creative_ae9_vlog(res, fl, true);
+	creative_ae9_vlog(chip, res, fl, true);
 	if ((fl & 0xf) == 1 && ((res >> 21) & 0x1f) == 0x16)
 		atomic_inc(&chip->scp_unsol);
 }
@@ -610,7 +610,7 @@ static bool rirb_sweep(struct creative_chip *chip, u16 hw, int want, u32 *res, u
 			got = mine = true;
 			chip->rirb_wanswer++;
 		} else {
-			creative_ae9_vlog(r, f, true);	/* an old answer: dropped */
+			creative_ae9_vlog(chip, r, f, true);	/* an old answer: dropped */
 		}
 		dev_info_ratelimited(chip->dev, "RIRB entry %u landed after it was given up%s\n",
 				     z, mine ? ": the answer waited for" : "");
@@ -955,7 +955,7 @@ static int ae9_corb_send_verb_sync(struct creative_chip *chip, u32 verb, u32 *re
 		}
 	}
 	chip->rirb_rp = wp_start;
-	writew(wp_start, chip->hda_regs + AZX_REG_RIRBWP);
+	ae9_writew_flush(chip, wp_start, chip->hda_regs + AZX_REG_RIRBWP);
 
 	/* Send the verb via CORB; its answer can only be in a slot after this */
 	chip->rirb_send_wp = wp_start;
@@ -1063,18 +1063,18 @@ static int ae9_corb_send_verb_sync(struct creative_chip *chip, u32 verb, u32 *re
 			cur_rirb_wp = wp;
 		cur_rirb_wp &= 0xff;
 
-		writeb(0x00, chip->hda_regs + AZX_REG_CORBCTL);	/* stop */
+		ae9_writeb_flush(chip, 0x00, chip->hda_regs + AZX_REG_CORBCTL);	/* stop */
 		for (t = 0; t < 100 && (readb(chip->hda_regs + AZX_REG_CORBCTL) & 0x02); t++)
 			udelay(10);
-		writew(0x8000, chip->hda_regs + AZX_REG_CORBRP);	/* RP reset */
+		ae9_writew_flush(chip, 0x8000, chip->hda_regs + AZX_REG_CORBRP);	/* RP reset */
 		for (t = 0; t < 100 && !(readw(chip->hda_regs + AZX_REG_CORBRP) & 0x8000); t++)
 			udelay(10);
-		writew(0x0000, chip->hda_regs + AZX_REG_CORBRP);
+		ae9_writew_flush(chip, 0x0000, chip->hda_regs + AZX_REG_CORBRP);
 		for (t = 0; t < 100 && (readw(chip->hda_regs + AZX_REG_CORBRP) & 0x8000); t++)
 			udelay(10);
-		writew(0x0000, chip->hda_regs + AZX_REG_CORBWP);	/* WP = 0 */
+		ae9_writew_flush(chip, 0x0000, chip->hda_regs + AZX_REG_CORBWP);	/* WP = 0 */
 		chip->corb_wp = 0;
-		writeb(CORBCTL_RUN, chip->hda_regs + AZX_REG_CORBCTL);	/* run + error irq */
+		ae9_writeb_flush(chip, CORBCTL_RUN, chip->hda_regs + AZX_REG_CORBCTL);	/* run + error irq */
 
 		/* skip responses that may still arrive for the dropped verb,
 		 * but count the DSP reply announcements among them: skipping
@@ -1101,7 +1101,7 @@ static int ae9_corb_send_verb_sync(struct creative_chip *chip, u32 verb, u32 *re
 
 got_response:
 	/* the solicited response, taken from the RIRB in the poll loop */
-	creative_ae9_vlog(got_res, got_fl, true);
+	creative_ae9_vlog(chip, got_res, got_fl, true);
 	if (resp)
 		*resp = got_res;
 
@@ -1110,7 +1110,7 @@ got_response:
 
 	/* Update RIRB read pointer to acknowledge consumption */
 	chip->rirb_rp = wp;
-	writew(wp, chip->hda_regs + AZX_REG_RIRBWP);
+	ae9_writew_flush(chip, wp, chip->hda_regs + AZX_REG_RIRBWP);
 	wmb();
 
 	mutex_unlock(&chip->corb_mutex);

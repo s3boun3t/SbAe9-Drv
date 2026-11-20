@@ -127,6 +127,7 @@ enum { DEVICE_AE7_AE9 = 0x0010,	  /* AE-7 / AE-9 (CA0132 Sound Core3D) */
  * the write-back acks pending status (e.g. a period interrupt). */
 #define SD_CTL_WMASK	0x00ffffff
 #define CREATIVE_SUBSYS_AE9		0x0071
+#define CREATIVE_SUBSYS_AE7		0x0081
 
 /* ------------------------------------------------------------------ */
 /* Per-device BAR layout descriptor					  */
@@ -157,7 +158,9 @@ struct creative_chip {
 						 * dead_work or dead notice any more
 						 * (the PCMs and card go away) */
 	atomic_t		bdl_leaks;	/* BDLs kept: their stream didn't stop */
+	bool			ae7;
 	bool			asmedia;	/* behind an ASMedia ASM1083/1085 bridge */
+	bool			posted_flush;
 	size_t			dma_pad;	/* spare bytes after every DMA buffer */
 	void __iomem		*ext_regs;	/* BAR2 */
 
@@ -617,6 +620,7 @@ int creative_i2c_raw_tx(struct creative_chip *chip, u8 reg,
 
 /* creative_ae9_pcm.c */
 int creative_ae9_pcm_init(struct creative_chip *chip);
+int creative_ae7_pcm_init(struct creative_chip *chip);
 /* native DSD64 (pcm_dsd): stop a DSD stream and take DSD down (Direct Mode
  * off, output switch, suspend, unload); the DAC mute after a trigger */
 void creative_ae9_dsd_abort(struct creative_chip *chip, const char *why);
@@ -697,7 +701,7 @@ int creative_dsp_chipio_read(struct creative_chip *chip,
 			     unsigned int addx, unsigned int *data);
 int creative_dsp_prepare(struct creative_chip *chip);
 int creative_dsp_load_firmware(struct creative_chip *chip);
-void creative_ae9_vlog(u32 val, u32 ex, bool is_resp);
+void creative_ae9_vlog(struct creative_chip *chip, u32 val, u32 ex, bool is_resp);
 u16 creative_ae9_stream_format(unsigned int channels, unsigned int bits,
 				unsigned int rate);
 void creative_ae9_cap_irq(struct creative_chip *chip);
@@ -708,6 +712,10 @@ int creative_dsp_scp_send(struct creative_chip *chip, u32 hdr,
 			  const u32 *data, unsigned int count);
 void creative_dsp_chipio_addr_invalidate(void);
 int creative_dsp_boot_handshake(struct creative_chip *chip);
+int creative_ae7_prepare_bar2(struct creative_chip *chip);
+int creative_ae7_pre_download(struct creative_chip *chip);
+int creative_ae7_route_headphones(struct creative_chip *chip);
+void creative_ae7_mute_headphones(struct creative_chip *chip);
 
 /*
  * debug=0 (default): startup, user actions and problems only. debug=1:
@@ -781,13 +789,11 @@ u8 creative_dsp_ca0113_read(struct creative_chip *chip, u8 group, u8 reg, u32 ra
  * BAR2 writes read the card's ID register (0x4) instead, because reading
  * back the head-unit UART data register (0xc00) would lose a byte.
  */
-extern bool ae9_posted_flush;
-
 static inline void creative_hda_writel(struct creative_chip *chip,
 				       unsigned int reg, u32 val)
 {
 	writel(val, chip->hda_regs + reg);
-	if (ae9_posted_flush)
+	if (chip->posted_flush)
 		(void)readl(chip->hda_regs + reg);
 	wmb(); /* docs/history/Creative.md §2.2: barrier after every write */
 }
@@ -804,7 +810,7 @@ static inline void creative_ext_writel(struct creative_chip *chip,
 				       unsigned int reg, u32 val)
 {
 	writel(val, chip->ext_regs + reg);
-	if (ae9_posted_flush)
+	if (chip->posted_flush)
 		(void)readl(chip->ext_regs + 0x4);
 	wmb(); /* docs/history/Creative.md §2.2: barrier after every write */
 }
@@ -821,7 +827,7 @@ static inline void creative_ext_writeb(struct creative_chip *chip,
 				       unsigned int reg, u8 val)
 {
 	writeb(val, chip->ext_regs + reg);
-	if (ae9_posted_flush)
+	if (chip->posted_flush)
 		(void)readl(chip->ext_regs + 0x4);
 	wmb();
 }
@@ -838,7 +844,7 @@ static inline void creative_ext_writew(struct creative_chip *chip,
 				       unsigned int reg, u16 val)
 {
 	writew(val, chip->ext_regs + reg);
-	if (ae9_posted_flush)
+	if (chip->posted_flush)
 		(void)readl(chip->ext_regs + 0x4);
 	wmb();
 }
@@ -847,7 +853,7 @@ static inline void creative_hda_writeb(struct creative_chip *chip,
 				       unsigned int reg, u8 val)
 {
 	writeb(val, chip->hda_regs + reg);
-	if (ae9_posted_flush)
+	if (chip->posted_flush)
 		(void)readb(chip->hda_regs + reg);
 	wmb();
 }
@@ -864,7 +870,7 @@ static inline void creative_hda_writew(struct creative_chip *chip,
 				       unsigned int reg, u16 val)
 {
 	writew(val, chip->hda_regs + reg);
-	if (ae9_posted_flush)
+	if (chip->posted_flush)
 		(void)readw(chip->hda_regs + reg);
 	wmb();
 }
@@ -878,36 +884,31 @@ static inline u16 creative_hda_readw(struct creative_chip *chip,
 }
 
 /*
- * posted_flush for the driver's raw writel/writew/writeb calls (BAR0 stream
- * and ring registers, BAR2 0x304): the same register read back after the
- * write. Defined after the wrappers above, so they keep the plain writes.
+ * Posted writes to cached stream/ring register pointers need the same
+ * per-device readback as the BAR-relative accessors.
  */
-static inline void ae9_writel_flush(u32 v, void __iomem *a)
+static inline void ae9_writel_flush(struct creative_chip *chip, u32 v,
+				    void __iomem *a)
 {
 	writel(v, a);
-	if (ae9_posted_flush)
+	if (chip->posted_flush)
 		(void)readl(a);
 }
 
-static inline void ae9_writew_flush(u16 v, void __iomem *a)
+static inline void ae9_writew_flush(struct creative_chip *chip, u16 v,
+				    void __iomem *a)
 {
 	writew(v, a);
-	if (ae9_posted_flush)
+	if (chip->posted_flush)
 		(void)readw(a);
 }
 
-static inline void ae9_writeb_flush(u8 v, void __iomem *a)
+static inline void ae9_writeb_flush(struct creative_chip *chip, u8 v,
+				    void __iomem *a)
 {
 	writeb(v, a);
-	if (ae9_posted_flush)
+	if (chip->posted_flush)
 		(void)readb(a);
 }
-
-#undef writel
-#undef writew
-#undef writeb
-#define writel(v, a)	ae9_writel_flush(v, a)
-#define writew(v, a)	ae9_writew_flush(v, a)
-#define writeb(v, a)	ae9_writeb_flush(v, a)
 
 #endif /* __CREATIVE_AE9_H */
