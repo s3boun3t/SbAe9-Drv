@@ -11,6 +11,33 @@ this one does, by doing what Creative's Windows driver does, step by step.
 [Releases](https://github.com/3xHelix/SbAe9-Drv/releases) ·
 Pre-releases, tested on two cards.
 
+## Experimental AE-7 headphone playback
+
+This fork branch adds opt-in support for the Sound Blaster AE-7
+(PCI `1102:0010`, subsystem `1102:0081`, tested with an ASMedia ASM1085
+bridge). The current scope is stereo headphone playback at 48 kHz in DSP
+mode with SBX effects off. The AE-7 has its own board sequence and shares
+the driver's HDA transport, firmware loader, and DMA code.
+
+- `ae7_claim=1` reserves the AE-7 for this driver. Add `ae7_codec_check=1`
+  for a transport-only check or `ae7_dsp=1` to enable headphone playback.
+- The [early boot helper](scripts/initramfs-tools/00-creative-ae7) targets
+  the AE-7 PCI subsystem. The [ALSA route](config/creative-ae7-pcm.conf),
+  [ACP profile](config/creative-ae7.conf), and
+  [udev rule](config/89-ae7-pipewire.rules) expose **Sound Blaster AE-7
+  Headphones** in Linux Mint.
+- Plex playback through the headphones was confirmed on the 0.12.15
+  build on Linux Mint with XanMod `7.3.3-x64v3-xanmod1`. AudioMon also
+  detected the Plex stream on the earlier 0.12.14-based trial.
+- Mint applies software volume. The headphone module's physical knob
+  adjusts listening level independently, and Mint's slider does not
+  follow the knob.
+- The trial changed startup DAC attenuation from 24.5 dB to 12 dB. A low
+  physical headphone volume setting explained the quiet playback, so the
+  need for the DAC change has yet to be established.
+- Speakers, inputs, optical audio, Direct Mode, and DSD remain outside
+  the current AE-7 scope.
+
 ## 💣 New in v0.12.15: native DSD64, now on by default
 
 **Native DSD. On Linux. On a PCIe sound card.** As far as we can tell,
